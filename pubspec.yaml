@@ -6,13 +6,13 @@ homepage: https://github.com/ljmatan/obfuscator
 issue_tracker: https://github.com/ljmatan/obfuscator/issues
 
 environment:
-  sdk: '>=3.8.1 <4.0.0'
+  sdk: ^3.9.2
 
 executables:
   obfuscator: obfuscator
 
 dependencies:
-  analyzer: ^8.1.1
+  analyzer: ^8.2.0
   dart_style: ^3.1.2
   args: ^2.7.0
   path: ^1.9.1

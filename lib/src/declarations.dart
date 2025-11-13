@@ -186,7 +186,15 @@ class _ObjectDeclarationCollectorTopLevel extends analyzer_visitor.RecursiveAstV
   void visitClassDeclaration(
     analyzer_ast.ClassDeclaration node,
   ) {
-    if (!_declarationCollector._hasPublicApiAnnotationOrExcludedName(node)) {
+    // Check for @freezed or @RoutePage annotation. If present, do not obfuscate this class.
+    final hasFreezedAnnotation = node.metadata.any(
+      (meta) => meta.name.name == 'freezed',
+    );
+    final hasRoutePageAnnotation = node.metadata.any(
+      (meta) => meta.name.name == 'RoutePage',
+    );
+
+    if (!hasFreezedAnnotation && !hasRoutePageAnnotation && !_declarationCollector._hasPublicApiAnnotationOrExcludedName(node)) {
       _declarationCollector._addDeclaration(
         ObjectDeclaration(
           filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
