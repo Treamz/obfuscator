@@ -139,6 +139,14 @@ class ObjectDeclarationCollector {
   /// Collection of declarations collected by a class instance.
   ///
   final collection = <ObjectDeclaration>{};
+
+  /// Adds an [ObjectDeclaration] to the collection if its type is [analyzer_ast.ClassDeclaration].
+  ///
+  void _addDeclaration(ObjectDeclaration declaration) {
+    if (declaration.type == analyzer_ast.ClassDeclaration) {
+      collection.add(declaration);
+    }
+  }
 }
 
 /// Import statements.
@@ -179,7 +187,7 @@ class _ObjectDeclarationCollectorTopLevel extends analyzer_visitor.RecursiveAstV
     analyzer_ast.ClassDeclaration node,
   ) {
     if (!_declarationCollector._hasPublicApiAnnotationOrExcludedName(node)) {
-      _declarationCollector.collection.add(
+      _declarationCollector._addDeclaration(
         ObjectDeclaration(
           filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
           element: node.declaredFragment?.element,
@@ -200,7 +208,7 @@ class _ObjectDeclarationCollectorTopLevel extends analyzer_visitor.RecursiveAstV
     if (!_declarationCollector._hasPublicApiAnnotationOrExcludedName(node) &&
         node.name?.lexeme.isNotEmpty == true &&
         node.name?.lexeme != '_') {
-      _declarationCollector.collection.add(
+      _declarationCollector._addDeclaration(
         ObjectDeclaration(
           filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
           element: node.declaredFragment?.enclosingFragment?.element,
@@ -219,7 +227,7 @@ class _ObjectDeclarationCollectorTopLevel extends analyzer_visitor.RecursiveAstV
     analyzer_ast.EnumDeclaration node,
   ) {
     if (!_declarationCollector._hasPublicApiAnnotationOrExcludedName(node)) {
-      _declarationCollector.collection.add(
+      _declarationCollector._addDeclaration(
         ObjectDeclaration(
           filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
           element: node.declaredFragment?.element,
@@ -238,7 +246,7 @@ class _ObjectDeclarationCollectorTopLevel extends analyzer_visitor.RecursiveAstV
     analyzer_ast.MixinDeclaration node,
   ) {
     if (!_declarationCollector._hasPublicApiAnnotationOrExcludedName(node)) {
-      _declarationCollector.collection.add(
+      _declarationCollector._addDeclaration(
         ObjectDeclaration(
           filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
           element: node.declaredFragment?.element,
@@ -257,7 +265,7 @@ class _ObjectDeclarationCollectorTopLevel extends analyzer_visitor.RecursiveAstV
     analyzer_ast.ExtensionDeclaration node,
   ) {
     if (!_declarationCollector._hasPublicApiAnnotationOrExcludedName(node)) {
-      _declarationCollector.collection.add(
+      _declarationCollector._addDeclaration(
         ObjectDeclaration(
           filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
           element: node.declaredFragment?.element,
@@ -297,7 +305,7 @@ class _ObjectDeclarationCollectorMethodsFunctions extends analyzer_visitor.Recur
         referenceElement: node.declaredFragment?.element,
       );
       if (!isOverriden || parent?.name != null) {
-        _declarationCollector.collection.add(
+        _declarationCollector._addDeclaration(
           ObjectDeclaration(
             filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
             element: parentElement ?? node.declaredFragment?.element,
@@ -319,7 +327,7 @@ class _ObjectDeclarationCollectorMethodsFunctions extends analyzer_visitor.Recur
     if (!_declarationCollector._hasPublicApiAnnotationOrExcludedName(node)) {
       final parentId = _declarationCollector._collector.getEnclosingFunctionName(node);
       if (parentId != null) {
-        _declarationCollector.collection.add(
+        _declarationCollector._addDeclaration(
           ObjectDeclaration(
             filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
             element: node.declaredFragment?.element,
@@ -347,7 +355,7 @@ class _ObjectDeclarationCollectorFields extends analyzer_visitor.RecursiveAstVis
     analyzer_ast.EnumConstantDeclaration node,
   ) {
     if (!_declarationCollector._hasPublicApiAnnotationOrExcludedName(node)) {
-      _declarationCollector.collection.add(
+      _declarationCollector._addDeclaration(
         ObjectDeclaration(
           filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
           element: node.declaredFragment?.element,
@@ -380,7 +388,7 @@ class _ObjectDeclarationCollectorFields extends analyzer_visitor.RecursiveAstVis
           fieldName: element?.name,
         );
         if (!isOverriden || parent?.name != null) {
-          _declarationCollector.collection.add(
+          _declarationCollector._addDeclaration(
             ObjectDeclaration(
               filePath: _declarationCollector._collector.currentObjectCollectorSource.file.path,
               element: parentElement ?? element,

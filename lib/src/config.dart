@@ -266,7 +266,8 @@ class Configuration {
   /// Defaults to the [NoObfuscation] annotation identifier provided by the library.
   ///
   final publicApiIdentifiers = <String>[
-    (NoObfuscation).toString(),
+    'NoObfuscation',
+    'publicApi',
   ];
 
   /// Set and validate the public API identifier collection.
