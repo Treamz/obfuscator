@@ -172,6 +172,29 @@ class _ObjectReferenceCollectorTopLevel extends analyzer_visitor.RecursiveAstVis
     }
     super.visitNamedType(node);
   }
+
+  @override
+  void visitConstructorDeclaration(
+    analyzer_ast.ConstructorDeclaration node,
+  ) {
+    final parent = node.parent;
+    if (parent is analyzer_ast.ClassDeclaration) {
+      final classElement = parent.declaredFragment?.element;
+      final library = classElement?.library;
+      if (_referenceCollector._isInternalImplementation(library)) {
+        _referenceCollector.collection.add(
+          ObjectReference(
+            filePath: _referenceCollector._collector.currentObjectCollectorSource.file.path,
+            parentElement: classElement, // The class element
+            parentId: classElement?.name,
+            lexeme: node.returnType.toSource(),
+            offset: node.returnType.offset,
+          ),
+        );
+      }
+    }
+    super.visitConstructorDeclaration(node);
+  }
 }
 
 class _ObjectReferenceCollectorMethodsFunctions extends analyzer_visitor.RecursiveAstVisitor {

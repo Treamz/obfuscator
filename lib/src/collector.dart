@@ -140,7 +140,7 @@ class ObjectCollector {
   Future<void> _collectSources() async {
     for (final analyzedContext in _configuration.analysisContextCollection.contexts) {
       for (final filePath in analyzedContext.contextRoot.analyzedFiles()) {
-        if (filePath.endsWith('.dart')) {
+        if (filePath.endsWith('.dart') && !filePath.endsWith('.gr.dart')) {
           final session = analyzedContext.currentSession;
           final resolvedUnit =
               await session.getResolvedUnit(
