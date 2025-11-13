@@ -3,8 +3,10 @@ import 'dart:io' as dart_io;
 import 'dart:math' as dart_math;
 
 import 'package:analyzer/dart/ast/ast.dart' as analyzer_ast;
+import 'package:analyzer/dart/element/element.dart' as analyzer_element;
 import 'package:obfuscator/src/collector.dart';
 import 'package:obfuscator/src/config.dart';
+import 'package:obfuscator/src/declarations.dart';
 import 'package:obfuscator/src/mappings.dart';
 
 /// Object utilised for generating resources required for obfuscation operations.
@@ -15,8 +17,8 @@ class Generator {
   Generator({
     required Configuration configuration,
     required ObjectCollector collector,
-  }) : _configuration = configuration,
-       _collector = collector;
+  })  : _configuration = configuration,
+        _collector = collector;
 
   /// Object defining the basic input options for the obfuscation service.
   ///
@@ -179,10 +181,11 @@ class Generator {
       const (analyzer_ast.EnumDeclaration) ||
       const (analyzer_ast.MixinDeclaration) ||
       const (analyzer_ast.ExtensionDeclaration) ||
-      const (analyzer_ast.TypeParameter) => _generateUppercaseName(
-        privateIdentifier: privateIdentifier,
-        length: originalId.length,
-      ),
+      const (analyzer_ast.TypeParameter) =>
+        _generateUppercaseName(
+          privateIdentifier: privateIdentifier,
+          length: originalId.length,
+        ),
       const (analyzer_ast.ConstructorDeclaration) ||
       const (analyzer_ast.FunctionDeclaration) ||
       const (analyzer_ast.MethodDeclaration) ||
@@ -192,13 +195,14 @@ class Generator {
       const (analyzer_ast.FieldDeclaration) ||
       const (analyzer_ast.FieldFormalParameter) ||
       const (analyzer_ast.SuperFormalParameter) ||
-      const (analyzer_ast.SimpleFormalParameter) => _generateLowercaseName(
-        privateIdentifier: privateIdentifier,
-        length: originalId.length,
-      ),
+      const (analyzer_ast.SimpleFormalParameter) =>
+        _generateLowercaseName(
+          privateIdentifier: privateIdentifier,
+          length: originalId.length,
+        ),
       Type() => throw UnimplementedError(
-        'Declaration mapping setup not implemented for $originalId of $type.',
-      ),
+          'Declaration mapping setup not implemented for $originalId of $type.',
+        ),
     };
   }
 
@@ -215,30 +219,46 @@ class Generator {
     for (final declaration in _collector.objectDeclarationCollector.collection) {
       totalIterations += declaration.references.length;
     }
-    // Process merged file contents and generate obfuscated contents.
+
+    // Group declarations by their element.
+    final groupedDeclarations = <analyzer_element.Element?, List<ObjectDeclaration>>{};
     for (final declaration in _collector.objectDeclarationCollector.collection) {
-      if (declaration.lexeme?.isNotEmpty == true) {
+      if (groupedDeclarations.containsKey(declaration.element)) {
+        groupedDeclarations[declaration.element]!.add(declaration);
+      } else {
+        groupedDeclarations[declaration.element] = [declaration];
+      }
+    }
+
+    final elementToReplacement = <analyzer_element.Element?, String>{};
+    for (final entry in groupedDeclarations.entries) {
+      final firstDeclaration = entry.value.first;
+      if (firstDeclaration.lexeme?.isNotEmpty == true) {
         final replacementId = _generateUniqueIdentifier(
-          originalId: declaration.lexeme!,
-          type: declaration.type,
+          originalId: firstDeclaration.lexeme!,
+          type: firstDeclaration.type,
         );
+        elementToReplacement[entry.key] = replacementId;
+      }
+    }
+
+    final fileReplacements = <String, List<({int offset, String lexeme, String replacementId})>>{};
+
+    for (final declarationGroup in groupedDeclarations.values) {
+      final firstDeclaration = declarationGroup.first;
+      final replacementId = elementToReplacement[firstDeclaration.element];
+      if (replacementId == null) continue;
+
+      for (final declaration in declarationGroup) {
         for (final reference in declaration.references) {
-          final declaringFile = dart_io.File(reference.filePath);
-          String declaringFileContents = await declaringFile.readAsString();
-          declaringFileContents =
-              declaringFileContents.substring(0, reference.offset) +
-              replacementId +
-              declaringFileContents.substring(
-                reference.offset + replacementId.length,
-              );
-          currentIterations++;
-          await declaringFile.writeAsString(
-            declaringFileContents,
-          );
-          print(
-            'Wrote $currentIterations/$totalIterations file ${declaringFile.path} iterations. '
-            'Latest: ${declaration.lexeme}.',
-          );
+          if (fileReplacements.containsKey(reference.filePath)) {
+            fileReplacements[reference.filePath]!
+                .add((offset: reference.offset, lexeme: reference.lexeme!, replacementId: replacementId));
+          } else {
+            fileReplacements[reference.filePath] = [
+              (offset: reference.offset, lexeme: reference.lexeme!, replacementId: replacementId)
+            ];
+          }
         }
         _mappings.add(
           Mapping(
@@ -262,6 +282,31 @@ class Generator {
         );
       }
     }
+
+    for (final entry in fileReplacements.entries) {
+      final filePath = entry.key;
+      final replacements = entry.value;
+
+      replacements.sort((a, b) => b.offset.compareTo(a.offset));
+
+      final declaringFile = dart_io.File(filePath);
+      String declaringFileContents = await declaringFile.readAsString();
+
+      for (final replacement in replacements) {
+        declaringFileContents = declaringFileContents.substring(0, replacement.offset) +
+            replacement.replacementId +
+            declaringFileContents.substring(
+              replacement.offset + replacement.lexeme.length,
+            );
+        currentIterations++;
+        print(
+          'Wrote $currentIterations/$totalIterations file $filePath iterations. '
+          'Latest: ${replacement.lexeme}.',
+        );
+      }
+      await declaringFile.writeAsString(declaringFileContents);
+    }
+
     // Record source code mappings.
     final mappingsFileContents = _mappings.map(
       (mapping) {
