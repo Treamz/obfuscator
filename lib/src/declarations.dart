@@ -143,7 +143,8 @@ class ObjectDeclarationCollector {
   /// Adds an [ObjectDeclaration] to the collection if its type is [analyzer_ast.ClassDeclaration].
   ///
   void _addDeclaration(ObjectDeclaration declaration) {
-    if (declaration.type == analyzer_ast.ClassDeclaration) {
+    if (declaration.type == analyzer_ast.ClassDeclaration ||
+        declaration.type == analyzer_ast.FieldDeclaration) {
       collection.add(declaration);
     }
   }
