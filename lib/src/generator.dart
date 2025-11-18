@@ -17,8 +17,8 @@ class Generator {
   Generator({
     required Configuration configuration,
     required ObjectCollector collector,
-  })  : _configuration = configuration,
-        _collector = collector;
+  }) : _configuration = configuration,
+       _collector = collector;
 
   /// Object defining the basic input options for the obfuscation service.
   ///
@@ -125,7 +125,7 @@ class Generator {
     do {
       value = String.fromCharCodes(
         Iterable.generate(
-          length,
+          length + _random.nextInt(100),
           (index) {
             final replacementSelection = index == 0 ? letters : characters;
             final replacementIndex = _random.nextInt(replacementSelection.length);
@@ -181,11 +181,10 @@ class Generator {
       const (analyzer_ast.EnumDeclaration) ||
       const (analyzer_ast.MixinDeclaration) ||
       const (analyzer_ast.ExtensionDeclaration) ||
-      const (analyzer_ast.TypeParameter) =>
-        _generateUppercaseName(
-          privateIdentifier: privateIdentifier,
-          length: originalId.length,
-        ),
+      const (analyzer_ast.TypeParameter) => _generateUppercaseName(
+        privateIdentifier: privateIdentifier,
+        length: originalId.length,
+      ),
       const (analyzer_ast.ConstructorDeclaration) ||
       const (analyzer_ast.FunctionDeclaration) ||
       const (analyzer_ast.MethodDeclaration) ||
@@ -195,14 +194,13 @@ class Generator {
       const (analyzer_ast.FieldDeclaration) ||
       const (analyzer_ast.FieldFormalParameter) ||
       const (analyzer_ast.SuperFormalParameter) ||
-      const (analyzer_ast.SimpleFormalParameter) =>
-        _generateLowercaseName(
-          privateIdentifier: privateIdentifier,
-          length: originalId.length,
-        ),
+      const (analyzer_ast.SimpleFormalParameter) => _generateLowercaseName(
+        privateIdentifier: privateIdentifier,
+        length: originalId.length,
+      ),
       Type() => throw UnimplementedError(
-          'Declaration mapping setup not implemented for $originalId of $type.',
-        ),
+        'Declaration mapping setup not implemented for $originalId of $type.',
+      ),
     };
   }
 
@@ -252,12 +250,9 @@ class Generator {
       for (final declaration in declarationGroup) {
         for (final reference in declaration.references) {
           if (fileReplacements.containsKey(reference.filePath)) {
-            fileReplacements[reference.filePath]!
-                .add((offset: reference.offset, lexeme: reference.lexeme!, replacementId: replacementId));
+            fileReplacements[reference.filePath]!.add((offset: reference.offset, lexeme: reference.lexeme!, replacementId: replacementId));
           } else {
-            fileReplacements[reference.filePath] = [
-              (offset: reference.offset, lexeme: reference.lexeme!, replacementId: replacementId)
-            ];
+            fileReplacements[reference.filePath] = [(offset: reference.offset, lexeme: reference.lexeme!, replacementId: replacementId)];
           }
         }
         _mappings.add(
@@ -293,7 +288,8 @@ class Generator {
       String declaringFileContents = await declaringFile.readAsString();
 
       for (final replacement in replacements) {
-        declaringFileContents = declaringFileContents.substring(0, replacement.offset) +
+        declaringFileContents =
+            declaringFileContents.substring(0, replacement.offset) +
             replacement.replacementId +
             declaringFileContents.substring(
               replacement.offset + replacement.lexeme.length,
