@@ -267,6 +267,7 @@ class Configuration {
   ///
   final publicApiIdentifiers = <String>[
     (NoObfuscation).toString(),
+    'publicApi',
   ];
 
   /// Set and validate the public API identifier collection.
