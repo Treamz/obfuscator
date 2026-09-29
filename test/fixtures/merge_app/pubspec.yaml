@@ -1,0 +1,17 @@
+name: merge_app
+description: Fixture covering the merged output.
+publish_to: none
+environment:
+  sdk: ^3.10.0
+dependencies:
+  localdep:
+    path: ../deps/localdep
+  otherdep:
+    path: ../deps/otherdep
+dependency_overrides:
+  localdep:
+    path: ../deps/localdep
+flutter:
+  assets:
+    - assets/data.txt
+    - path: assets/dir/

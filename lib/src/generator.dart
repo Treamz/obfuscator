@@ -2,11 +2,8 @@ import 'dart:convert' as dart_convert;
 import 'dart:io' as dart_io;
 import 'dart:math' as dart_math;
 
-import 'package:analyzer/dart/ast/ast.dart' as analyzer_ast;
-import 'package:analyzer/dart/element/element.dart' as analyzer_element;
 import 'package:obfuscator/src/collector.dart';
 import 'package:obfuscator/src/config.dart';
-import 'package:obfuscator/src/declarations.dart';
 import 'package:obfuscator/src/mappings.dart';
 
 /// Object utilised for generating resources required for obfuscation operations.
@@ -18,7 +15,8 @@ class Generator {
     required Configuration configuration,
     required ObjectCollector collector,
   }) : _configuration = configuration,
-       _collector = collector;
+       _collector = collector,
+       _random = dart_math.Random(configuration.seed);
 
   /// Object defining the basic input options for the obfuscation service.
   ///
@@ -44,6 +42,7 @@ class Generator {
     'assert',
     'async',
     'await',
+    'base',
     'break',
     'case',
     'catch',
@@ -66,7 +65,7 @@ class Generator {
     'final',
     'finally',
     'for',
-    'Function',
+    'function',
     'get',
     'hide',
     'if',
@@ -80,12 +79,14 @@ class Generator {
     'mixin',
     'new',
     'null',
+    'of',
     'on',
     'operator',
     'part',
     'required',
     'rethrow',
     'return',
+    'sealed',
     'set',
     'show',
     'static',
@@ -96,222 +97,117 @@ class Generator {
     'throw',
     'true',
     'try',
+    'type',
     'typedef',
     'var',
     'void',
+    'when',
     'while',
     'with',
     'yield',
   };
 
+  /// Minimum length of a generated name, excluding the privacy prefix.
+  ///
+  static const _minimumNameLength = 8;
+
   /// Random value generator.
   ///
-  final _random = dart_math.Random();
+  final dart_math.Random _random;
 
-  /// Generates a random string of the specified [length].
+  /// Generates a unique random name for the [symbol].
   ///
-  /// The first letter of the string can be uppercased by specifying [firstLetterUppercase] as `true`.
+  /// Class names start with an uppercase letter and field names with a lowercase one.
+  /// Private names remain private. Names never collide with the identifiers used in the source code.
   ///
-  String _generateRandomString({
-    required bool firstLetterUppercase,
-    int length = 10,
-    required bool privateIdentifier,
-  }) {
-    if (privateIdentifier) length--;
+  String _generateName(ObfuscatedSymbol symbol) {
     const letters = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
-    const numbers = '0123456789';
-    const characters = letters + numbers;
+    const characters = '${letters}0123456789';
+    final isPrivate = symbol.name.startsWith('_');
+    final baseLength = dart_math.max(_minimumNameLength, symbol.name.length);
     late String value;
     do {
-      value = String.fromCharCodes(
-        Iterable.generate(
-          length + _random.nextInt(100),
-          (index) {
-            final replacementSelection = index == 0 ? letters : characters;
-            final replacementIndex = _random.nextInt(replacementSelection.length);
-            return replacementSelection.codeUnitAt(replacementIndex);
-          },
-        ),
-      );
-      if (firstLetterUppercase) {
-        value = value[0].toUpperCase() + value.substring(1);
-      } else {
-        value = value[0].toLowerCase() + value.substring(1);
+      final length = baseLength + _random.nextInt(baseLength + 1);
+      final buffer = StringBuffer();
+      for (var index = 0; index < length; index++) {
+        final selection = index == 0 ? letters : characters;
+        buffer.writeCharCode(selection.codeUnitAt(_random.nextInt(selection.length)));
       }
-    } while (_reservedKeywords.contains(value.toLowerCase()) || _generatedNames.contains(value));
+      value = buffer.toString();
+      value = switch (symbol.kind) {
+        ObfuscatedSymbolKind.classDeclaration => value[0].toUpperCase() + value.substring(1),
+        ObfuscatedSymbolKind.field => value[0].toLowerCase() + value.substring(1),
+      };
+      if (isPrivate) value = '_$value';
+    } while (_reservedKeywords.contains(value.toLowerCase()) ||
+        _generatedNames.contains(value) ||
+        _collector.usedIdentifiers.contains(value));
     _generatedNames.add(value);
-    return privateIdentifier ? '_$value' : value;
+    return value;
   }
 
-  /// Generates a name with first letter being uppercase.
-  ///
-  String _generateUppercaseName({
-    required int length,
-    required bool privateIdentifier,
-  }) {
-    return _generateRandomString(
-      length: length,
-      firstLetterUppercase: true,
-      privateIdentifier: privateIdentifier,
-    );
-  }
-
-  /// Generates a name with first letter being lowercase.
-  ///
-  String _generateLowercaseName({
-    required int length,
-    required bool privateIdentifier,
-  }) {
-    return _generateRandomString(
-      length: length,
-      firstLetterUppercase: false,
-      privateIdentifier: privateIdentifier,
-    );
-  }
-
-  /// Generates a unique identifier from the [originalId] value.
-  ///
-  String _generateUniqueIdentifier({
-    required String originalId,
-    required Type type,
-  }) {
-    final privateIdentifier = originalId.startsWith('_') == true;
-    return switch (type) {
-      const (analyzer_ast.ClassDeclaration) ||
-      const (analyzer_ast.EnumDeclaration) ||
-      const (analyzer_ast.MixinDeclaration) ||
-      const (analyzer_ast.ExtensionDeclaration) ||
-      const (analyzer_ast.TypeParameter) => _generateUppercaseName(
-        privateIdentifier: privateIdentifier,
-        length: originalId.length,
-      ),
-      const (analyzer_ast.ConstructorDeclaration) ||
-      const (analyzer_ast.FunctionDeclaration) ||
-      const (analyzer_ast.MethodDeclaration) ||
-      const (analyzer_ast.EnumConstantDeclaration) ||
-      const (analyzer_ast.TopLevelVariableDeclaration) ||
-      const (analyzer_ast.VariableDeclaration) ||
-      const (analyzer_ast.FieldDeclaration) ||
-      const (analyzer_ast.FieldFormalParameter) ||
-      const (analyzer_ast.SuperFormalParameter) ||
-      const (analyzer_ast.SimpleFormalParameter) => _generateLowercaseName(
-        privateIdentifier: privateIdentifier,
-        length: originalId.length,
-      ),
-      Type() => throw UnimplementedError(
-        'Declaration mapping setup not implemented for $originalId of $type.',
-      ),
-    };
-  }
-
-  /// Collection of unobfuscated names and their respective replacement mappings.
-  ///
-  final _mappings = <Mapping>[];
-
-  /// Replaces the copied file contents with new top-level object identifiers.
+  /// Replaces the copied file contents with the obfuscated identifiers and records the mappings.
   ///
   Future<void> processCopiedSourceDirectories() async {
-    // Define iterations count, used for debugging and user review.
-    int currentIterations = 0;
-    int totalIterations = 0;
-    for (final declaration in _collector.objectDeclarationCollector.collection) {
-      totalIterations += declaration.references.length;
-    }
+    final mappings = <Mapping>[];
+    final fileEdits = <String, List<({int offset, int length, String text, ObfuscatedSymbol symbol})>>{};
 
-    // Group declarations by their element.
-    final groupedDeclarations = <analyzer_element.Element?, List<ObjectDeclaration>>{};
-    for (final declaration in _collector.objectDeclarationCollector.collection) {
-      if (groupedDeclarations.containsKey(declaration.element)) {
-        groupedDeclarations[declaration.element]!.add(declaration);
-      } else {
-        groupedDeclarations[declaration.element] = [declaration];
-      }
-    }
-
-    final elementToReplacement = <analyzer_element.Element?, String>{};
-    for (final entry in groupedDeclarations.entries) {
-      final firstDeclaration = entry.value.first;
-      if (firstDeclaration.lexeme?.isNotEmpty == true) {
-        final replacementId = _generateUniqueIdentifier(
-          originalId: firstDeclaration.lexeme!,
-          type: firstDeclaration.type,
+    for (final symbol in _collector.symbols) {
+      final replacement = _generateName(symbol);
+      for (final occurrence in symbol.occurrences) {
+        fileEdits.putIfAbsent(occurrence.filePath, () => []).add(
+          (offset: occurrence.offset, length: occurrence.length, text: replacement, symbol: symbol),
         );
-        elementToReplacement[entry.key] = replacementId;
       }
+      final declaration = symbol.occurrences.firstWhere((occurrence) => occurrence.isDeclaration);
+      mappings.add(
+        Mapping(
+          filePath: declaration.filePath,
+          id: symbol.name,
+          replacementId: replacement,
+          parentId: symbol.parentName,
+          offset: declaration.offset,
+          referenceMappings: [
+            for (final occurrence in symbol.occurrences)
+              Mapping(
+                filePath: occurrence.filePath,
+                id: symbol.name,
+                replacementId: replacement,
+                parentId: symbol.parentName,
+                offset: occurrence.offset,
+                referenceMappings: null,
+              ),
+          ],
+        ),
+      );
     }
 
-    final fileReplacements = <String, List<({int offset, String lexeme, String replacementId})>>{};
-
-    for (final declarationGroup in groupedDeclarations.values) {
-      final firstDeclaration = declarationGroup.first;
-      final replacementId = elementToReplacement[firstDeclaration.element];
-      if (replacementId == null) continue;
-
-      for (final declaration in declarationGroup) {
-        for (final reference in declaration.references) {
-          if (fileReplacements.containsKey(reference.filePath)) {
-            fileReplacements[reference.filePath]!.add((offset: reference.offset, lexeme: reference.lexeme!, replacementId: replacementId));
-          } else {
-            fileReplacements[reference.filePath] = [(offset: reference.offset, lexeme: reference.lexeme!, replacementId: replacementId)];
-          }
+    for (final entry in fileEdits.entries) {
+      final file = dart_io.File(entry.key);
+      var contents = await file.readAsString();
+      final edits = entry.value..sort((a, b) => b.offset.compareTo(a.offset));
+      var previousOffset = contents.length + 1;
+      for (final edit in edits) {
+        // Edits are applied from the end of the file, so that the offsets remain valid.
+        if (edit.offset + edit.length > previousOffset || (edit.offset == previousOffset && edit.length == 0)) {
+          throw StateError('Overlapping replacements in ${file.path} at offset ${edit.offset}.');
         }
-        _mappings.add(
-          Mapping(
-            filePath: declaration.filePath,
-            id: declaration.lexeme,
-            replacementId: replacementId,
-            parentId: declaration.parentId,
-            offset: declaration.offset,
-            referenceMappings: [
-              for (final reference in declaration.references)
-                Mapping(
-                  filePath: reference.filePath,
-                  id: reference.lexeme,
-                  replacementId: replacementId,
-                  parentId: reference.parentId,
-                  offset: reference.offset,
-                  referenceMappings: null,
-                ),
-            ],
-          ),
-        );
+        if (edit.length > 0 && contents.substring(edit.offset, edit.offset + edit.length) != edit.symbol.name) {
+          throw StateError(
+            'Unexpected source contents in ${file.path} at offset ${edit.offset}, expected "${edit.symbol.name}".',
+          );
+        }
+        contents = contents.replaceRange(edit.offset, edit.offset + edit.length, edit.text);
+        previousOffset = edit.offset;
       }
-    }
-
-    for (final entry in fileReplacements.entries) {
-      final filePath = entry.key;
-      final replacements = entry.value;
-
-      replacements.sort((a, b) => b.offset.compareTo(a.offset));
-
-      final declaringFile = dart_io.File(filePath);
-      String declaringFileContents = await declaringFile.readAsString();
-
-      for (final replacement in replacements) {
-        declaringFileContents =
-            declaringFileContents.substring(0, replacement.offset) +
-            replacement.replacementId +
-            declaringFileContents.substring(
-              replacement.offset + replacement.lexeme.length,
-            );
-        currentIterations++;
-        print(
-          'Wrote $currentIterations/$totalIterations file $filePath iterations. '
-          'Latest: ${replacement.lexeme}.',
-        );
-      }
-      await declaringFile.writeAsString(declaringFileContents);
+      await file.writeAsString(contents);
+      print('Obfuscated ${edits.length} identifier(s) in ${file.path}.');
     }
 
     // Record source code mappings.
-    final mappingsFileContents = _mappings.map(
-      (mapping) {
-        return mapping.toJson();
-      },
-    ).toList();
     await _configuration.outputMappingsFile.writeAsString(
       dart_convert.jsonEncode(
-        mappingsFileContents,
+        [for (final mapping in mappings) mapping.toJson()],
       ),
     );
   }

@@ -6,6 +6,57 @@ import 'package:dart_style/dart_style.dart' as dart_style;
 import 'package:path/path.dart' as path;
 import 'package:obfuscator/src/annotation.dart';
 import 'package:pubspec_parse/pubspec_parse.dart' as pubspec_parse;
+import 'package:yaml_edit/yaml_edit.dart' as yaml_edit;
+
+/// Error raised for invalid input or environment, reported to the user without a stack trace.
+///
+class ConfigurationException implements Exception {
+  /// Creates an exception described by the user-facing [message].
+  ///
+  const ConfigurationException(this.message);
+
+  /// User-facing description of the problem.
+  ///
+  final String message;
+
+  @override
+  String toString() => message;
+}
+
+/// A Dart package provided for obfuscation with the `--src` argument.
+///
+class SourcePackage {
+  /// Creates a reference to the package placed in [sourceDirectory] and described by [pubspec].
+  ///
+  SourcePackage({
+    required this.sourceDirectory,
+    required this.pubspec,
+  });
+
+  /// Location of the original package sources, which are never modified.
+  ///
+  final dart_io.Directory sourceDirectory;
+
+  /// Parsed contents of the original `pubspec.yaml` file.
+  ///
+  final pubspec_parse.Pubspec pubspec;
+
+  /// Location of the copied (obfuscated) package sources.
+  ///
+  late dart_io.Directory copyDirectory;
+
+  /// Package identifier, as defined with the `pubspec.yaml` file.
+  ///
+  String get name => pubspec.name;
+
+  /// Whether the package requires the Flutter SDK for dependency resolution.
+  ///
+  bool get usesFlutter => [
+    ...pubspec.dependencies.values,
+    ...pubspec.devDependencies.values,
+    ...pubspec.dependencyOverrides.values,
+  ].any((dependency) => dependency is pubspec_parse.SdkDependency && dependency.sdk == 'flutter');
+}
 
 /// Object defining the basic input options for the obfuscation service.
 ///
@@ -20,15 +71,30 @@ class Configuration {
   ///
   final List<String> _arguments;
 
+  /// Name of the file marking a directory as created by this tool.
+  ///
+  /// Only directories containing this file (or empty ones) are ever deleted by the tool.
+  ///
+  static const outputMarkerFileName = '.obfuscator_output';
+
+  /// Top-level entries of a source package which are not copied to the output.
+  ///
+  static const _skippedRootEntries = {'build'};
+
+  /// Entries which are not copied to the output, regardless of their location.
+  ///
+  static const _skippedEntries = {'.git', '.dart_tool'};
+
   /// Validate and retrieve the CLI arguments.
   ///
-  ({String sourceDirectoriesArg, String outputDirectoryArg, String? publicApiIdentifiersArg}) _processArguments(
+  ({String sourceDirectoriesArg, String outputDirectoryArg, String? publicApiIdentifiersArg, int? seed}) _processArguments(
     List<String> arguments,
   ) {
     // Define argument identifiers.
     const sourceDirectoriesId = 'sourceDirectories';
     const outputDirectoryId = 'outputDirectory';
     const publicApiIdentifierId = 'publicApiIdentifiers';
+    const seedId = 'seed';
 
     // Instantiate and setup argument parser.
     final argumentParser = args.ArgParser(
@@ -39,21 +105,29 @@ class Configuration {
       (
         id: sourceDirectoriesId,
         alias: 'src',
-        help: 'Comma-separated directories in which source files to be obfuscated are placed (e.g., "./lib/,./other_lib/").',
+        help: 'Comma-separated package directories (each containing a pubspec.yaml file) to be obfuscated.',
         mandatory: true,
       ),
       (
         id: outputDirectoryId,
         alias: 'out',
-        help: 'The output directory of the obfuscation command (e.g., "./build/").',
+        help:
+            'The output directory of the obfuscation command. '
+            'It must be empty, missing, or created by a previous run of this tool.',
         mandatory: true,
       ),
       (
         id: publicApiIdentifierId,
         alias: 'pub',
         help:
-            'Optional annotation or object identifier for the values marked as not to be obfuscated. '
-            'Defaults to the "DontObfuscate" annotation provided by the library.',
+            'Comma-separated annotation or declaration identifiers for the values marked as not to be obfuscated. '
+            'The "NoObfuscation" and "publicApi" identifiers are always included.',
+        mandatory: false,
+      ),
+      (
+        id: seedId,
+        alias: 'seed',
+        help: 'Optional integer seed for generating deterministic obfuscated identifiers.',
         mandatory: false,
       ),
     }) {
@@ -71,65 +145,173 @@ class Configuration {
       help: 'Show usage information.',
     );
 
-    // If no arguments are specified or the `--help` flag is provided, print help and exit.
-    if (arguments.isEmpty || arguments.contains('--help') || arguments.contains('-h')) {
+    void printUsage() {
       print('Dart Obfuscator CLI');
       print('');
-      print('Usage: dart run bin/main.dart --src=<directories> --out=<directory> [--pub=<annotations>]');
+      print('Usage: obfuscator --src=<directories> --out=<directory> [--pub=<identifiers>] [--seed=<integer>]');
       print('');
       print(argumentParser.usage);
+    }
+
+    // If no arguments are specified or the `--help` flag is provided, print help and exit.
+    if (arguments.isEmpty || arguments.contains('--help') || arguments.contains('-h')) {
+      printUsage();
       dart_io.exit(0);
     }
 
-    final cliArguments = argumentParser.parse(arguments);
-
-    // Validate and return argument values.
-    final sourceDirectoriesArg = cliArguments.option(sourceDirectoriesId);
-    final outputDirectoryArg = cliArguments.option(outputDirectoryId);
-    final publicApiIdentifiersArg = cliArguments.option(publicApiIdentifierId);
-    return (
-      sourceDirectoriesArg: sourceDirectoriesArg!,
-      outputDirectoryArg: outputDirectoryArg!,
-      publicApiIdentifiersArg: publicApiIdentifiersArg,
-    );
+    try {
+      final cliArguments = argumentParser.parse(arguments);
+      final seedArg = cliArguments.option(seedId);
+      final seed = seedArg == null ? null : int.tryParse(seedArg);
+      if (seedArg != null && seed == null) {
+        throw ConfigurationException('The --seed value must be an integer, got "$seedArg".');
+      }
+      return (
+        sourceDirectoriesArg: cliArguments.option(sourceDirectoriesId)!,
+        outputDirectoryArg: cliArguments.option(outputDirectoryId)!,
+        publicApiIdentifiersArg: cliArguments.option(publicApiIdentifierId),
+        seed: seed,
+      );
+    } on args.ArgParserException catch (e) {
+      printUsage();
+      throw ConfigurationException(e.message);
+    } on ArgumentError catch (e) {
+      printUsage();
+      throw ConfigurationException('${e.message}');
+    }
   }
 
-  /// Comma-separated directory paths in which source files to be obfuscated are placed (e.g., `"./lib/,./other_lib/"`).
+  /// Splits a comma-separated argument value, ignoring whitespace and empty entries.
   ///
-  late List<dart_io.Directory> sourceDirectories;
+  static List<String> _splitList(String value) {
+    return [
+      for (final entry in value.split(','))
+        if (entry.trim().isNotEmpty) entry.trim(),
+    ];
+  }
 
-  /// Set and validate the source directories fields.
+  /// Returns the absolute, normalized [location] with any symbolic links resolved.
   ///
-  void _initialiseSourceDirectories({
+  /// Links are resolved for the longest existing part of the path, so that non-existing
+  /// locations can be compared with the existing ones.
+  ///
+  static String _resolvePath(String location) {
+    final canonical = path.canonicalize(location);
+    var current = canonical;
+    final missingSegments = <String>[];
+    while (true) {
+      if (dart_io.FileSystemEntity.typeSync(current) != dart_io.FileSystemEntityType.notFound) {
+        final resolved = dart_io.Directory(current).resolveSymbolicLinksSync();
+        return path.joinAll([resolved, ...missingSegments.reversed]);
+      }
+      final parent = path.dirname(current);
+      if (parent == current) return canonical;
+      missingSegments.add(path.basename(current));
+      current = parent;
+    }
+  }
+
+  /// Packages provided for obfuscation.
+  ///
+  final packages = <SourcePackage>[];
+
+  /// Directories in which source files to be obfuscated are placed.
+  ///
+  List<dart_io.Directory> get sourceDirectories => [for (final package in packages) package.sourceDirectory];
+
+  /// The identifiers of the packages to be obfuscated, derived from the `pubspec.yaml` files.
+  ///
+  List<String> get sourcePackages => [for (final package in packages) package.name];
+
+  /// Validate the source directories and parse their `pubspec.yaml` files.
+  ///
+  void _initialiseSourcePackages({
     required String sourceDirectoriesArg,
   }) {
-    final sourceDirectoriesPaths = sourceDirectoriesArg.split(',');
-    sourceDirectories = sourceDirectoriesPaths.map(
-      (dirPath) {
-        return dart_io.Directory(dirPath);
-      },
-    ).toList();
+    final sourceDirectoriesPaths = _splitList(sourceDirectoriesArg);
+    if (sourceDirectoriesPaths.isEmpty) {
+      throw const ConfigurationException('No source directories were provided with the --src argument.');
+    }
+    for (final sourceDirectoryPath in sourceDirectoriesPaths) {
+      final directory = dart_io.Directory(_resolvePath(sourceDirectoryPath));
+      if (!directory.existsSync()) {
+        throw ConfigurationException('Source directory "$sourceDirectoryPath" not found.');
+      }
+      final pubspecFile = dart_io.File(path.join(directory.path, 'pubspec.yaml'));
+      if (!pubspecFile.existsSync()) {
+        throw ConfigurationException('Source directory "$sourceDirectoryPath" does not contain a pubspec.yaml file.');
+      }
+      final pubspec_parse.Pubspec pubspec;
+      try {
+        pubspec = pubspec_parse.Pubspec.parse(
+          pubspecFile.readAsStringSync(),
+          sourceUrl: pubspecFile.uri,
+        );
+      } catch (e) {
+        throw ConfigurationException('Unable to parse ${pubspecFile.path}:\n$e');
+      }
+      if (packages.any((package) => package.sourceDirectory.path == directory.path)) {
+        throw ConfigurationException('Source directory "$sourceDirectoryPath" is provided more than once.');
+      }
+      if (packages.any((package) => package.name == pubspec.name)) {
+        throw ConfigurationException('Multiple source directories define the same package name "${pubspec.name}".');
+      }
+      packages.add(
+        SourcePackage(
+          sourceDirectory: directory,
+          pubspec: pubspec,
+        ),
+      );
+    }
+    for (final package in packages) {
+      for (final other in packages) {
+        if (package != other && path.isWithin(other.sourceDirectory.path, package.sourceDirectory.path)) {
+          throw ConfigurationException(
+            'Source directory "${package.sourceDirectory.path}" is placed within "${other.sourceDirectory.path}".',
+          );
+        }
+      }
+    }
   }
 
   /// The output directory of the obfuscation command (e.g., `"./build/"`).
   ///
   late dart_io.Directory outputDirectory;
 
-  /// Create and reset any current output directory state.
+  /// Validate, create and reset any current output directory state.
   ///
   void _initialiseOutputDirectory({
     required String outputDirectoryArg,
   }) {
-    outputDirectory = dart_io.Directory(outputDirectoryArg);
-    try {
-      outputDirectory.deleteSync(
-        recursive: true,
-      );
-    } catch (e) {
-      // No output folder is present.
+    outputDirectory = dart_io.Directory(_resolvePath(outputDirectoryArg));
+    for (final package in packages) {
+      final sourcePath = package.sourceDirectory.path;
+      if (path.equals(sourcePath, outputDirectory.path) ||
+          path.isWithin(sourcePath, outputDirectory.path) ||
+          path.isWithin(outputDirectory.path, sourcePath)) {
+        throw ConfigurationException(
+          'The output directory "${outputDirectory.path}" must not be the same as, placed within, '
+          'or contain the source directory "$sourcePath".',
+        );
+      }
     }
-    outputDirectory.createSync(
-      recursive: true,
+    final outputType = dart_io.FileSystemEntity.typeSync(outputDirectory.path, followLinks: false);
+    if (outputType == dart_io.FileSystemEntityType.directory) {
+      final isEmpty = outputDirectory.listSync().isEmpty;
+      final isPreviousOutput = dart_io.File(path.join(outputDirectory.path, outputMarkerFileName)).existsSync();
+      if (!isEmpty && !isPreviousOutput) {
+        throw ConfigurationException(
+          'The output directory "${outputDirectory.path}" is not empty and was not created by this tool. '
+          'Remove it manually or provide a different location.',
+        );
+      }
+      outputDirectory.deleteSync(recursive: true);
+    } else if (outputType != dart_io.FileSystemEntityType.notFound) {
+      throw ConfigurationException('The output location "${outputDirectory.path}" is not a directory.');
+    }
+    outputDirectory.createSync(recursive: true);
+    dart_io.File(path.join(outputDirectory.path, outputMarkerFileName)).writeAsStringSync(
+      'Created by the Dart Obfuscator. The contents of this directory are deleted on each run.\n',
     );
   }
 
@@ -137,75 +319,157 @@ class Configuration {
   ///
   late dart_io.Directory sourceDirectoriesCopy;
 
+  /// Recursively copies the [source] directory contents to the [destination] directory.
+  ///
+  /// Symbolic links are copied as links rather than followed. Relative links pointing outside of the
+  /// [sourceRoot] are converted to absolute ones, so that they keep pointing to the same location.
+  ///
+  void _copyDirectory({
+    required dart_io.Directory source,
+    required dart_io.Directory destination,
+    required String sourceRoot,
+    required bool isRoot,
+  }) {
+    destination.createSync(recursive: true);
+    for (final entity in source.listSync(followLinks: false)) {
+      final name = path.basename(entity.path);
+      if (_skippedEntries.contains(name) || isRoot && _skippedRootEntries.contains(name)) continue;
+      final newPath = path.join(destination.path, name);
+      if (entity is dart_io.Link) {
+        var target = entity.targetSync();
+        if (path.isRelative(target)) {
+          final absoluteTarget = path.normalize(path.join(path.dirname(entity.path), target));
+          if (!path.equals(sourceRoot, absoluteTarget) && !path.isWithin(sourceRoot, absoluteTarget)) {
+            target = absoluteTarget;
+          }
+        }
+        dart_io.Link(newPath).createSync(target);
+      } else if (entity is dart_io.File) {
+        entity.copySync(newPath);
+      } else if (entity is dart_io.Directory) {
+        _copyDirectory(
+          source: entity,
+          destination: dart_io.Directory(newPath),
+          sourceRoot: sourceRoot,
+          isRoot: false,
+        );
+      }
+    }
+  }
+
+  /// Adjusts the copied `pubspec.yaml` file of the [package] so that it resolves from the copy location.
+  ///
+  /// The `resolution: workspace` entry is removed, and relative path dependencies are converted
+  /// to absolute ones, or to the copy locations for the packages which are obfuscated as well.
+  ///
+  void _updateCopiedPubspec(SourcePackage package) {
+    final pubspecFile = dart_io.File(path.join(package.copyDirectory.path, 'pubspec.yaml'));
+    final editor = yaml_edit.YamlEditor(pubspecFile.readAsStringSync());
+    final contents = editor.parseAt([]).value;
+    if (contents is! Map) return;
+    if (contents['resolution'] == 'workspace') {
+      editor.remove(['resolution']);
+    }
+    for (final section in const ['dependencies', 'dev_dependencies', 'dependency_overrides']) {
+      final dependencies = contents[section];
+      if (dependencies is! Map) continue;
+      for (final entry in dependencies.entries) {
+        final dependency = entry.value;
+        if (dependency is! Map || dependency['path'] is! String) continue;
+        editor.update(
+          [section, entry.key, 'path'],
+          resolveDependencyPath(
+            package: package,
+            dependencyPath: dependency['path'] as String,
+            preferCopies: true,
+          ),
+        );
+      }
+    }
+    pubspecFile.writeAsStringSync(editor.toString());
+  }
+
+  /// Returns the absolute location of a path dependency declared by [package] as [dependencyPath].
+  ///
+  /// If the dependency is one of the obfuscated packages and [preferCopies] is `true`,
+  /// the location of its copy is returned instead.
+  ///
+  String resolveDependencyPath({
+    required SourcePackage package,
+    required String dependencyPath,
+    required bool preferCopies,
+  }) {
+    final absolutePath = _resolvePath(path.join(package.sourceDirectory.path, dependencyPath));
+    if (preferCopies) {
+      for (final other in packages) {
+        if (path.equals(other.sourceDirectory.path, absolutePath)) return other.copyDirectory.path;
+      }
+    }
+    return absolutePath;
+  }
+
+  /// Runs `pub get` in the [directory], using the Flutter tool if [flutter] is `true`.
+  ///
+  /// Throws a [ConfigurationException] if the dependencies can't be resolved.
+  ///
+  static Future<void> runPubGet({
+    required dart_io.Directory directory,
+    required bool flutter,
+  }) async {
+    final executable = flutter ? 'flutter' : 'dart';
+    var lastError = '';
+    for (final extraArguments in const [
+      <String>[],
+      <String>['--offline'],
+    ]) {
+      final dart_io.ProcessResult result;
+      try {
+        result = await dart_io.Process.run(
+          executable,
+          ['pub', 'get', ...extraArguments],
+          workingDirectory: directory.path,
+          runInShell: dart_io.Platform.isWindows,
+        );
+      } on dart_io.ProcessException catch (e) {
+        throw ConfigurationException('Unable to run "$executable pub get" in ${directory.path}: ${e.message}');
+      }
+      if (result.exitCode == 0) return;
+      lastError = '${result.stdout}\n${result.stderr}'.trim();
+    }
+    throw ConfigurationException('"$executable pub get" failed in ${directory.path}:\n$lastError');
+  }
+
   /// Define locations and copy source code directories to the newly-created `copy` folder.
   ///
   Future<void> _initialiseSourceDirectoriesCopy() async {
-    /// Helper method to recursively copy a directory's contents.
-    ///
-    Future<void> _copyDirectorySync({
-      required dart_io.Directory source,
-      required dart_io.Directory destination,
-    }) async {
-      if (!destination.existsSync()) {
-        destination.createSync(recursive: true);
-      }
-      for (final entity in source.listSync()) {
-        final newPath = path.join(destination.path, path.basename(entity.path));
-        if (entity is dart_io.File) {
-          if (path.basename(entity.path) == 'pubspec.yaml') {
-            // Remove `resolution: workspace` if detected.
-            try {
-              String content = entity.readAsStringSync();
-              final pattern = RegExp(r'^\s*resolution:\s*workspace\s*$', multiLine: true);
-              String newContent = content.replaceAll(pattern, '');
-              dart_io.File(newPath)..writeAsStringSync(newContent);
-            } catch (e) {
-              print('Error processing pubspec.yaml at ${entity.path}: $e');
-              entity.copySync(newPath);
-            }
-          } else {
-            entity.copySync(newPath);
-          }
-        } else if (entity is dart_io.Directory) {
-          _copyDirectorySync(
-            source: entity,
-            destination: dart_io.Directory(newPath),
-          );
+    sourceDirectoriesCopy = dart_io.Directory(
+      path.join(outputDirectory.path, 'copy'),
+    )..createSync(recursive: true);
+    final usedNames = <String>{};
+    for (final package in packages) {
+      var copyName = path.basename(package.sourceDirectory.path);
+      if (!usedNames.add(copyName)) {
+        copyName = package.name;
+        for (var index = 2; !usedNames.add(copyName); index++) {
+          copyName = '${package.name}_$index';
         }
       }
+      package.copyDirectory = dart_io.Directory(path.join(sourceDirectoriesCopy.path, copyName));
     }
-
-    final sourceDirectoriesCopyPath = path.join(
-      outputDirectory.path,
-      'copy',
-    );
-    sourceDirectoriesCopy = dart_io.Directory(
-      sourceDirectoriesCopyPath,
-    );
-    sourceDirectoriesCopy.createSync(
-      recursive: true,
-    );
-    for (final directory in sourceDirectories) {
-      final copiedDirectoryPath = path.join(
-        sourceDirectoriesCopyPath,
-        path.basename(directory.path),
+    for (final package in packages) {
+      _copyDirectory(
+        source: package.sourceDirectory,
+        destination: package.copyDirectory,
+        sourceRoot: package.sourceDirectory.path,
+        isRoot: true,
       );
-      final copiedDirectory = dart_io.Directory(
-        copiedDirectoryPath,
+      _updateCopiedPubspec(package);
+    }
+    for (final package in packages) {
+      await runPubGet(
+        directory: package.copyDirectory,
+        flutter: package.usesFlutter,
       );
-      _copyDirectorySync(
-        source: directory,
-        destination: copiedDirectory,
-      );
-      try {
-        await dart_io.Process.run(
-          'flutter',
-          const ['pub', 'get'],
-          workingDirectory: copiedDirectory.path,
-        );
-      } catch (e) {
-        print('Error running flutter pub get in ${copiedDirectory.path}');
-      }
     }
   }
 
@@ -213,52 +477,20 @@ class Configuration {
   ///
   late dart_io.File outputMappingsFile;
 
-  /// Allocate output mappings file resources.
-  ///
-  void _initialiseOutputMappingsFile() {
-    final outputMappingsFilePath = path.join(
-      outputDirectory.path,
-      'mappings.json',
-    );
-    outputMappingsFile = dart_io.File(
-      outputMappingsFilePath,
-    );
-    outputMappingsFile.createSync(
-      recursive: true,
-    );
-  }
-
   /// File definition of the merged code file.
   ///
   late dart_io.File outputMergedFile;
 
-  /// Allocate output merged file resources.
+  /// File definition for the merged `pubspec.yaml` file, derived from [packages].
   ///
-  void _initialiseOutputMergedFile() {
-    final outputMergedFilePath = path.join(
-      outputDirectory.path,
-      'lib',
-      'merged.dart',
-    );
-    outputMergedFile = dart_io.File(
-      outputMergedFilePath,
-    );
-    outputMergedFile.createSync(
-      recursive: true,
-    );
-  }
+  late dart_io.File mergedPubspecFile;
 
-  /// Set and validate the output directory location and any other relevant fields.
+  /// Allocate output file resources.
   ///
-  Future<void> _initialiseOutputSpecifications({
-    required String outputDirectoryArg,
-  }) async {
-    _initialiseOutputDirectory(
-      outputDirectoryArg: outputDirectoryArg,
-    );
-    await _initialiseSourceDirectoriesCopy();
-    _initialiseOutputMappingsFile();
-    _initialiseOutputMergedFile();
+  void _initialiseOutputFiles() {
+    outputMappingsFile = dart_io.File(path.join(outputDirectory.path, 'mappings.json'))..createSync(recursive: true);
+    outputMergedFile = dart_io.File(path.join(outputDirectory.path, 'lib', 'merged.dart'))..createSync(recursive: true);
+    mergedPubspecFile = dart_io.File(path.join(outputDirectory.path, 'pubspec.yaml'));
   }
 
   /// Optional annotation or object identifiers for the values marked as not to be obfuscated.
@@ -276,73 +508,13 @@ class Configuration {
     required String? publicApiIdentifiersArg,
   }) {
     if (publicApiIdentifiersArg != null) {
-      final specifiedIdentifiers = publicApiIdentifiersArg.split(',');
-      publicApiIdentifiers.addAll(specifiedIdentifiers);
+      publicApiIdentifiers.addAll(_splitList(publicApiIdentifiersArg));
     }
   }
 
-  /// The identifiers of the package to be obfuscated, derived from the `pubspec.yaml` file.
+  /// Optional seed used for generating deterministic identifiers.
   ///
-  final sourcePackages = <String>[];
-
-  /// Appends a [packageId] value to the [sourcePackages] collection.
-  ///
-  void _initialiseSourcePackages({
-    required String packageId,
-  }) {
-    sourcePackages.add(packageId);
-  }
-
-  /// Collection of dependencies defined with the source package implementations.
-  ///
-  final sourcePackageDependencies = <String, pubspec_parse.Dependency>{},
-      sourcePackageDevDependencies = <String, pubspec_parse.Dependency>{},
-      sourcePackageDependencyOverrides = <String, pubspec_parse.Dependency>{};
-
-  /// Optional configuration specific to Flutter packages.
-  ///
-  /// May include assets and other settings.
-  ///
-  Map<String, dynamic>? sourcePackageFlutterConfiguration;
-
-  /// File definition for the merged `pubspec.yaml` file, derived from [sourcePackages].
-  ///
-  late dart_io.File mergedPubspecFile;
-
-  /// Set and validate the source packages fields.
-  ///
-  void _processYamlFiles() {
-    for (final directory in sourceDirectories) {
-      if (!directory.existsSync()) {
-        print('Source root "${directory.path}" not found.');
-        dart_io.exit(1);
-      }
-      final pubspecFilePath = path.join(directory.path, 'pubspec.yaml');
-      final pubspecFile = dart_io.File(pubspecFilePath);
-      final pubspecFileContents = pubspecFile.readAsStringSync();
-      final pubspecParser = pubspec_parse.Pubspec.parse(pubspecFileContents);
-      _initialiseSourcePackages(
-        packageId: pubspecParser.name,
-      );
-      sourcePackageDependencies.addAll(
-        pubspecParser.dependencies,
-      );
-      sourcePackageDevDependencies.addAll(
-        pubspecParser.devDependencies,
-      );
-      sourcePackageDependencyOverrides.addAll(
-        pubspecParser.dependencyOverrides,
-      );
-      sourcePackageFlutterConfiguration = pubspecParser.flutter;
-    }
-    final mergedPubspecFilePath = path.join(
-      outputDirectory.path,
-      'pubspec.yaml',
-    );
-    mergedPubspecFile = dart_io.File(
-      mergedPubspecFilePath,
-    );
-  }
+  int? seed;
 
   /// A collection of analysis contexts.
   ///
@@ -351,13 +523,8 @@ class Configuration {
   /// Assign the analysis context collection values.
   ///
   void _initialiseAnalysisContextCollections() {
-    final sourceCopyDirectories = sourceDirectoriesCopy.listSync().whereType<dart_io.Directory>();
     analysisContextCollection = analyzer_context.AnalysisContextCollection(
-      includedPaths: sourceCopyDirectories.map(
-        (package) {
-          return path.join(package.path, 'lib');
-        },
-      ).toList(),
+      includedPaths: [for (final package in packages) package.copyDirectory.path],
     );
   }
 
@@ -371,18 +538,22 @@ class Configuration {
 
   /// Instantiate required class resources.
   ///
+  /// All of the inputs are validated before any file system changes are made.
+  ///
   Future<void> init() async {
     final args = _processArguments(_arguments);
-    _initialiseSourceDirectories(
-      sourceDirectoriesArg: args.sourceDirectoriesArg,
-    );
-    await _initialiseOutputSpecifications(
-      outputDirectoryArg: args.outputDirectoryArg,
-    );
+    seed = args.seed;
     _initialisePublicApiIdentifiers(
       publicApiIdentifiersArg: args.publicApiIdentifiersArg,
     );
-    _processYamlFiles();
+    _initialiseSourcePackages(
+      sourceDirectoriesArg: args.sourceDirectoriesArg,
+    );
+    _initialiseOutputDirectory(
+      outputDirectoryArg: args.outputDirectoryArg,
+    );
+    await _initialiseSourceDirectoriesCopy();
+    _initialiseOutputFiles();
     _initialiseAnalysisContextCollections();
   }
 }

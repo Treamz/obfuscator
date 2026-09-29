@@ -1,5 +1,9 @@
 include: package:lints/core.yaml
 
+analyzer:
+  exclude:
+    - test/fixtures/**
+
 linter:
   rules:
     prefer_single_quotes: true

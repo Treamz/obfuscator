@@ -4,7 +4,7 @@ A command-line tool that obfuscates Dart (including Flutter) source code by rena
 declarations and their references using the Dart analyzer.
 
 It is intended for preparing code to be shared as **private packages** or distributed
-in source form while reducing readability by renaming classes, mixins, methods, functions, and fields.
+in source form while reducing readability by renaming classes and fields.
 
 The tool works on copied project sources (it does not overwrite the original) and produces an obfuscated copy,
 a single merged `merged.dart` file for the codebase, and a generated `pubspec.yaml` that reflects
@@ -36,8 +36,11 @@ dependencies found in the sources.
 ## Features
 
 - Parse and resolve Dart source code using the Dart analyzer.
-- Discover declarations (classes, constructors, mixins, enums, typedefs, top-level functions, methods, fields, getters/setters).
-- Generate deterministic obfuscated identifiers and replace all references while preserving semantics.
+- Rename classes (including class type aliases) and fields (instance and static, including fields of mixins and enums),
+  along with all of their references, matched through the resolved element model.
+- Keep the program behaviour unchanged: fields overriding explicit getters/setters, third-party members,
+  or excluded declarations keep their original names, and so do the members overriding them.
+- Generate random obfuscated identifiers, or deterministic ones with the `--seed` argument.
 - Work on copies of supplied source folders; originals remain untouched.
 - Produce:
 
@@ -118,13 +121,13 @@ Run the main entrypoint `bin/obfuscator.dart`. The program accepts command-line 
 
 ### Required arguments
 
-- `--src` — comma-separated list of source project paths. Each path should be a directory containing Dart/Flutter source code to be processed. Example:
+- `--src` — comma-separated list of source package paths. Each path must be a directory containing a `pubspec.yaml` file. Example:
 
   ```
   --src /home/user/projects/app1,/home/user/projects/libpkg
   ```
 
-- `--out` — output directory where the processed (obfuscated) projects and generated artifacts will be written. The directory will be created if it does not exist. Example:
+- `--out` — output directory where the processed (obfuscated) projects and generated artifacts will be written. The directory will be created if it does not exist (see the requirements below). Example:
 
   ```
   --out /home/user/obf-output
@@ -135,7 +138,7 @@ Run the main entrypoint `bin/obfuscator.dart`. The program accepts command-line 
 - `--pub` — comma-separated list of annotation or object identifiers (fully-qualified or simple)
   that mark declarations **not** to be obfuscated.
 
-  Default: `NoObfuscation`
+  The `NoObfuscation` and `publicApi` identifiers are always included.
 
   - Example:
 
@@ -143,7 +146,14 @@ Run the main entrypoint `bin/obfuscator.dart`. The program accepts command-line 
     --pub NoObfuscation,MyCompany.DoNotObfuscate
     ```
 
+- `--seed` — integer seed used for generating the obfuscated identifiers.
+  Runs with the same seed and the same sources produce the same output.
+
 Run `dart run bin/obfuscator.dart --help` for the full list and precise flag naming.
+
+The output directory must be empty, missing, or created by a previous run of the tool
+(marked with a `.obfuscator_output` file), as its contents are deleted on each run.
+It must not be the same as, placed within, or contain any of the source directories.
 
 ### Examples
 
@@ -166,36 +176,49 @@ https://github.com/ljmatan/obfuscator/tree/main/output
 
 ## How it works (high level)
 
-1. **Copy**: The tool copies the source locations provided to the output directory into a working area.
-2. **Analysis**: Uses the Dart analyzer (resolved units via an `AnalysisContext`) to parse and fully resolve ASTs of the copied sources.
-3. **Discovery**: Walks declarations (classes, mixins, enums, typedefs, top-level functions, constructors, methods, fields, getters/setters) and builds a list of symbols to obfuscate.
-4. **Exclusions**: Skips symbols annotated with any supplied identifiers (from `--pub`) or other built-in exclusions (e.g., symbols matching certain whitelists).
-5. **Renaming / Mapping**: Generates obfuscated identifiers and computes a mapping from original name to obfuscated name.
-6. **Reference resolution**: Using the resolved AST and element model, the tool collects and updates all references to each renamed declaration (constructor calls, method invocations, prefixed identifiers, property accessors, initializers, etc.).
-7. **Replace**: Performs source edits (safely, preserving formatting where possible) on the copied files to rename declarations and references.
-8. **Generate merged.dart**: Writes a combined `merged.dart` containing the full codebase (useful to distribute a single-file source version).
-9. **Generate pubspec.yaml**: Scans `package` references and other metadata to create a `pubspec.yaml` for the obfuscated output (dependencies resolved as best-effort from imports).
+1. **Validate**: All of the inputs are validated before any file system changes are made.
+2. **Copy**: The source packages are copied to the output directory (excluding `.git`, `.dart_tool` and `build`),
+   relative path dependencies are made absolute, and `pub get` is run for each copy.
+3. **Analysis**: Every Dart file of the copied packages is resolved with the Dart analyzer,
+   including the files excluded with `analysis_options.yaml` (e.g., generated `*.g.dart` files).
+4. **Discovery**: Classes and fields declared in the `lib` directories are collected, skipping the excluded ones.
+   Fields overriding one another are grouped, and a group is renamed only if all of its members are renamable fields.
+5. **Reference resolution**: All references resolving to the collected declarations are recorded in all of the package
+   files (`lib`, `bin`, `test`, ...), including initializing formals, super parameters, named arguments, assignments,
+   object patterns, combinators and documentation comments.
+6. **Replace**: The copied files are rewritten with the generated names, and the mappings are recorded.
+7. **Generate merged.dart**: The `lib` files are merged into a single library. Directives are removed,
+   first-party import prefixes are dropped, and clashing top-level names are renamed.
+8. **Generate pubspec.yaml**: The dependencies, SDK constraints and Flutter assets of the source packages are merged.
 
 ---
 
 ## Generated outputs
 
 - `<out>/copy/<name>/...` — obfuscated copy of each provided source project.
-- `<out>/merged.dart` — single-file merge of the processed codebase.
-- `<out>/pubspec.yaml` — generated or inferred `pubspec.yaml`.
+- `<out>/lib/merged.dart` — single-file merge of the processed codebase.
+- `<out>/pubspec.yaml` — generated `pubspec.yaml`, merged from the source packages.
+- `<out>/assets/...` — assets and fonts declared by the source packages.
 - `<out>/mappings.json` — JSON map of original → obfuscated symbol names.
 
 ---
 
 ## Exclusion rules
 
-- **Default exclusion**: the tool looks for a `NoObfuscation` object (or other identifiers passed via `--pub`)
-  and will not obfuscate any matching declarations.
+- **Default exclusion**: the tool looks for the `NoObfuscation` and `publicApi` annotations (or other identifiers
+  passed via `--pub`) and will not obfuscate any matching declarations.
+
+- **What is excluded**:
+
+  - An excluded class, mixin or enum keeps its name, along with the names of all of its fields.
+  - An excluded field keeps its name, along with the fields overriding it or overridden by it.
+  - Classes annotated with `freezed`, `Freezed`, `unfreezed` or `RoutePage` are always excluded.
 
 - **How identifiers are matched**:
 
-  - Exact match by identifier name (e.g., `NoObfuscation`).
-  - Fully-qualified match if you provide the package path (e.g., `obfuscator.NoObfuscation`).
+  - Exact match by annotation name (e.g., `NoObfuscation` for `@NoObfuscation()`).
+  - Exact match by prefixed annotation name (e.g., `obfuscator.NoObfuscation` for `@obfuscator.NoObfuscation()`).
+  - Exact match by class or field name (e.g., `--pub AppLocalizations`).
 
 - **Common use cases**:
 
@@ -220,6 +243,11 @@ https://github.com/ljmatan/obfuscator/tree/main/output
 - **Generated code**: code generators (e.g., `build_runner`) may expect specific identifiers. Avoid renaming generated output unless you control the generator or also regenerate outputs appropriately.
 - **Third-party packages**: External packages referenced by name must remain consistent in `pubspec.yaml`; the tool tries to infer package dependencies by import, but manual verification is recommended.
 - **Edge cases in resolution**: some dynamic dispatch or runtime symbol lookups may not be detectable via static analysis; test thoroughly.
+  This includes `dynamic` member access, `Symbol` literals, `runtimeType.toString()` comparisons, and constructor tear-offs
+  assigned to function types with named parameters.
+- **Merged output**: the merged file is a single library, so library-level annotations, conditional imports of
+  first-party libraries, and multiple unnamed extensions with the same members may need manual adjustments.
+  The `flutter: generate: true` (localizations) setting is not supported.
 - **Legal**: ensure you have the right to obfuscate and distribute any source code; follow licenses and agreements.
 
 ---
@@ -238,14 +266,26 @@ https://github.com/ljmatan/obfuscator/tree/main/output
 
   - Ensure you run the tool on a **resolved AST** environment (the tool runs analyzer resolution internally for correctness).
   - Inspect `mappings.json` to confirm the mapping.
-  - Verify that constructor initializing formals, property accessors, or top-level getters are normalized to the underlying field/variable by the tool.
+  - Fields overriding explicit getters or setters, third-party members, or excluded declarations are never renamed.
 
 - Build or runtime errors after obfuscation:
 
   - Check for reflection usage or string-based lookups that reference symbol names.
   - Confirm generated `pubspec.yaml` dependencies are correct. If not, merge dependency entries from the original `pubspec.yaml` manually.
 
-- If the tool fails to recognize a declaration, ensure the file is syntactically valid Dart and that all dependent packages are resolvable by analyzer (you may need to run `dart pub get` in the source directories before running the tool).
+- If the tool fails to recognize a declaration, ensure the file is syntactically valid Dart and that all dependent packages are resolvable.
+  The tool reports analysis errors of the copied sources as warnings, and stops if `pub get` fails for any of the copies.
+
+---
+
+## Development
+
+Run the test suite, which obfuscates the fixture packages from `test/fixtures` and verifies that the obfuscated
+and merged programs are valid and produce the same output as the original ones:
+
+```bash
+dart test
+```
 
 ---
 
