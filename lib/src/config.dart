@@ -87,9 +87,9 @@ class Configuration {
   ///
   static const outputMarkerFileName = '.obfuscator_output';
 
-  /// Top-level entries of a source package which are not copied to the output.
+  /// Entries of a package directory (a directory containing a `pubspec.yaml` file) which are not copied.
   ///
-  static const _skippedRootEntries = {'build'};
+  static const _skippedPackageEntries = {'build'};
 
   /// Entries which are not copied to the output, regardless of their location.
   ///
@@ -338,12 +338,12 @@ class Configuration {
     required dart_io.Directory source,
     required dart_io.Directory destination,
     required String sourceRoot,
-    required bool isRoot,
   }) {
     destination.createSync(recursive: true);
+    final isPackageDirectory = dart_io.File(path.join(source.path, 'pubspec.yaml')).existsSync();
     for (final entity in source.listSync(followLinks: false)) {
       final name = path.basename(entity.path);
-      if (_skippedEntries.contains(name) || isRoot && _skippedRootEntries.contains(name)) continue;
+      if (_skippedEntries.contains(name) || isPackageDirectory && _skippedPackageEntries.contains(name)) continue;
       final newPath = path.join(destination.path, name);
       if (entity is dart_io.Link) {
         var target = entity.targetSync();
@@ -361,7 +361,6 @@ class Configuration {
           source: entity,
           destination: dart_io.Directory(newPath),
           sourceRoot: sourceRoot,
-          isRoot: false,
         );
       }
     }
@@ -369,19 +368,21 @@ class Configuration {
 
   /// Adjusts a copied `pubspec.yaml` file so that it resolves from the [copyDirectory] location.
   ///
-  /// The `resolution: workspace` entry is removed, and relative path dependencies, declared relative to
+  /// The `resolution: workspace` entry is removed (unless [keepWorkspaceResolution] is `true`, for the members
+  /// of a workspace which is copied as well), and relative path dependencies, declared relative to
   /// the [originalDirectory], are converted to absolute ones, or to the copy locations for the packages
   /// which are obfuscated as well.
   ///
   void _updateCopiedPubspec({
     required String copyDirectory,
     required String originalDirectory,
+    required bool keepWorkspaceResolution,
   }) {
     final pubspecFile = dart_io.File(path.join(copyDirectory, 'pubspec.yaml'));
     final editor = yaml_edit.YamlEditor(pubspecFile.readAsStringSync());
     final contents = editor.parseAt([]).value;
     if (contents is! Map) return;
-    if (contents['resolution'] == 'workspace') {
+    if (contents['resolution'] == 'workspace' && !keepWorkspaceResolution) {
       editor.remove(['resolution']);
     }
     for (final section in const ['dependencies', 'dev_dependencies', 'dependency_overrides']) {
@@ -416,8 +417,12 @@ class Configuration {
   }) {
     final absolutePath = _resolvePath(path.join(baseDirectory, dependencyPath));
     if (preferCopies) {
-      for (final other in packages) {
-        if (path.equals(other.sourceDirectory.path, absolutePath)) return other.copyDirectory.path;
+      // Locations within the obfuscated packages (e.g., their nested packages) are mapped to the copies.
+      for (final package in packages) {
+        final sourcePath = package.sourceDirectory.path;
+        if (path.equals(sourcePath, absolutePath) || path.isWithin(sourcePath, absolutePath)) {
+          return path.join(package.copyDirectory.path, path.relative(absolutePath, from: sourcePath));
+        }
       }
     }
     return absolutePath;
@@ -441,7 +446,8 @@ class Configuration {
       try {
         result = await dart_io.Process.run(
           executable,
-          ['pub', 'get', ...extraArguments],
+          // Nested packages (e.g., `example`) are resolved separately, as their failures are not fatal.
+          ['pub', 'get', '--no-example', ...extraArguments],
           workingDirectory: directory.path,
           runInShell: dart_io.Platform.isWindows,
         );
@@ -479,11 +485,11 @@ class Configuration {
         source: package.sourceDirectory,
         destination: package.copyDirectory,
         sourceRoot: package.sourceDirectory.path,
-        isRoot: true,
       );
       _updateCopiedPubspec(
         copyDirectory: package.copyDirectory.path,
         originalDirectory: package.sourceDirectory.path,
+        keepWorkspaceResolution: false,
       );
       _findNestedPackages(package, package.copyDirectory);
       for (final nestedDirectory in package.nestedPackageDirectories) {
@@ -493,6 +499,7 @@ class Configuration {
             package.sourceDirectory.path,
             path.relative(nestedDirectory, from: package.copyDirectory.path),
           ),
+          keepWorkspaceResolution: _isWithinCopiedWorkspace(package, nestedDirectory),
         );
       }
     }
@@ -519,6 +526,23 @@ class Configuration {
         }
       }
     }
+  }
+
+  /// Whether a package nested in the [nestedDirectory] of the copied [package] is placed within
+  /// a copied workspace root (a package with the `workspace` entry), which it may be a member of.
+  ///
+  static bool _isWithinCopiedWorkspace(SourcePackage package, String nestedDirectory) {
+    for (
+      var directory = path.dirname(nestedDirectory);
+      path.equals(directory, package.copyDirectory.path) || path.isWithin(package.copyDirectory.path, directory);
+      directory = path.dirname(directory)
+    ) {
+      final pubspecFile = dart_io.File(path.join(directory, 'pubspec.yaml'));
+      if (!pubspecFile.existsSync()) continue;
+      final contents = yaml_edit.YamlEditor(pubspecFile.readAsStringSync()).parseAt([]).value;
+      if (contents is Map && contents.containsKey('workspace')) return true;
+    }
+    return false;
   }
 
   /// Records the packages nested within the [directory] of the copied [package].

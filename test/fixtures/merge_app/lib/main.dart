@@ -4,12 +4,15 @@ import 'c.dart';
 import 'd.dart';
 import 'e.dart';
 import 'f.dart';
+import 'g.dart';
+import 'h.dart';
+import 'k.dart';
 import 'deferred.dart';
 import 'gen.dart';
 import 'route.dart';
 
 Future<void> main() async {
-  for (final line in [...aReport(), ...bReport(), ...cReport(), ...dReport(), ...eReport(), ...fReport(), ...genReport(), ...routeReport(), await deferredValue()]) {
+  for (final line in [...aReport(), ...bReport(), ...cReport(), ...dReport(), ...eReport(), ...fReport(), ...await gReport(), ...hReport(), ...kReport(), ...genReport(), ...routeReport(), await deferredValue()]) {
     print(line);
   }
 }

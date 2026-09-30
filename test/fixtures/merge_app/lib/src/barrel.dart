@@ -1,1 +1,1 @@
-export 'dart:collection' show Queue, SplayTreeMap;
+export 'dart:collection' show Queue, SplayTreeMap, HashSet;

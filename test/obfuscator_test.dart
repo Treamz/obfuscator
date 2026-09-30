@@ -196,7 +196,7 @@ void main() {
 
     test('removes all of the directives and first-party prefixes', () {
       expect(merged, isNot(contains('library ')));
-      expect(merged, isNot(contains('export ')));
+      expect(merged, isNot(contains('src/helpers.dart')));
       expect(merged, isNot(contains('part ')));
       expect(merged, isNot(matches(RegExp(r'\bh\.'))));
     });
@@ -213,12 +213,34 @@ void main() {
     });
 
     test('imports the third-party libraries re-exported by merged libraries', () {
-      expect(merged, contains("import 'dart:collection' show Queue, SplayTreeMap;"));
-      expect(merged, contains("import 'dart:collection' as ui show Queue, SplayTreeMap;"));
+      expect(merged, contains("import 'dart:collection' show Queue, SplayTreeMap, HashSet;"));
+      expect(merged, contains("import 'dart:collection' as ui show Queue, SplayTreeMap, HashSet;"));
     });
 
     test('renames top-level declarations clashing with import prefixes', () {
       expect(merged, contains('math_1'));
+    });
+
+    test('renames import prefixes shared by merged files for different libraries', () {
+      expect(merged, contains('as dep_1;'));
+      expect(merged, contains('as lazy_dep_1;'));
+    });
+
+    test('keeps the third-party exports of public libraries', () async {
+      expect(merged, contains("export 'dart:collection' show Queue, SplayTreeMap, HashSet;"));
+      // The first-party declaration clashing with an exported name is renamed.
+      expect(merged, contains('HashSet_1()'));
+      final consumer = Directory(path.join(_temp.path, 'consumer', 'lib'))..createSync(recursive: true);
+      File(path.join(consumer.parent.path, 'pubspec.yaml')).writeAsStringSync(
+        'name: consumer\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n  merged_app:\n    path: $output\n',
+      );
+      File(path.join(consumer.path, 'main.dart')).writeAsStringSync(
+        "import 'package:merged_app/merged.dart';\n\nvoid main() => print((HashSet<int>()..add(1)).length + Queue<int>().length);\n",
+      );
+      final pubGet = await _run('dart', ['pub', 'get', '--offline'], workingDirectory: consumer.parent.path);
+      expect(pubGet.exitCode, 0, reason: '${pubGet.stdout}${pubGet.stderr}');
+      expect(await _errors(consumer.parent.path), isEmpty);
+      expect(await _runDart(consumer.parent.path, 'lib/main.dart'), '1\n');
     });
 
     test('updates references of nested packages', () async {
@@ -306,6 +328,8 @@ void main() {
       Directory(path.join(root, '.git')).createSync();
       File(path.join(root, 'build', 'output.txt')).createSync(recursive: true);
       Link(path.join(root, 'loop')).createSync('.');
+      File(path.join(root, 'example', 'pubspec.yaml')).createSync(recursive: true);
+      File(path.join(root, 'example', 'build', 'output.dart')).createSync(recursive: true);
       Link(path.join(root, 'outside')).createSync('..');
       final output = path.join(_temp.path, 'out_links');
       final result = await _obfuscate(['--src=$root', '--out=$output']);
@@ -313,6 +337,7 @@ void main() {
       final copy = path.join(output, 'copy', 'shared');
       expect(Directory(path.join(copy, '.git')).existsSync(), isFalse);
       expect(Directory(path.join(copy, 'build')).existsSync(), isFalse);
+      expect(Directory(path.join(copy, 'example', 'build')).existsSync(), isFalse);
       expect(Link(path.join(copy, 'loop')).targetSync(), '.');
       expect(Link(path.join(copy, 'outside')).targetSync(), Directory(path.dirname(root)).resolveSymbolicLinksSync());
     });
@@ -341,6 +366,64 @@ void main() {
       expect(File(path.join(output.parent.path, 'shared_asset.txt')).existsSync(), isFalse);
       expect(File(path.join(output.path, 'pubspec.yaml')).readAsStringSync(), isNot(contains('shared_asset')));
       expect(result.stdout, contains('asset "../shared_asset.txt" of the shared_one package is placed outside of the package'));
+    });
+
+    test('supports workspace roots, keeping the resolution of their members', () async {
+      final root = Directory(path.join(_temp.path, 'workspace'));
+      File(path.join(root.path, 'pubspec.yaml'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync('name: ws_root\npublish_to: none\nenvironment:\n  sdk: ^3.10.0\nworkspace:\n  - packages/member\n');
+      File(path.join(root.path, 'lib', 'root.dart'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync('class Root {\n  int value = 1;\n}\n');
+      final member = path.join(root.path, 'packages', 'member');
+      File(path.join(member, 'pubspec.yaml'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync(
+          'name: ws_member\npublish_to: none\nresolution: workspace\nenvironment:\n  sdk: ^3.10.0\n'
+          'dependencies:\n  ws_root:\n    path: ../..\n',
+        );
+      File(path.join(member, 'lib', 'member.dart'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync("import 'package:ws_root/root.dart';\n\nint member() => Root().value;\n");
+      final output = path.join(_temp.path, 'out_workspace');
+      final result = await _obfuscate(['--src=${root.path}', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      final copiedMember = path.join(output, 'copy', 'workspace', 'packages', 'member');
+      expect(File(path.join(copiedMember, 'pubspec.yaml')).readAsStringSync(), contains('resolution: workspace'));
+      expect(await _errors(copiedMember), isEmpty);
+      expect(File(path.join(copiedMember, 'lib', 'member.dart')).readAsStringSync(), isNot(_containsWord('Root')));
+    });
+
+    test('maps path dependencies between nested packages to the copies', () async {
+      final root = Directory(path.join(_temp.path, 'nested'));
+      void write(String file, String contents) => File(path.join(root.path, file))
+        ..createSync(recursive: true)
+        ..writeAsStringSync(contents);
+      write('pubspec.yaml', 'name: nested_root\npublish_to: none\nenvironment:\n  sdk: ^3.10.0\n');
+      write('lib/root.dart', 'class Root {\n  int value = 1;\n}\n');
+      write(
+        'tools/b/pubspec.yaml',
+        'name: nested_b\npublish_to: none\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n  nested_root:\n    path: ../..\n',
+      );
+      write('tools/b/lib/b.dart', "import 'package:nested_root/root.dart';\n\nint b() => Root().value;\n");
+      write(
+        'tools/c/pubspec.yaml',
+        'name: nested_c\npublish_to: none\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n'
+            '  nested_root:\n    path: ../..\n  nested_b:\n    path: ../b\n',
+      );
+      write(
+        'tools/c/lib/c.dart',
+        "import 'package:nested_b/b.dart';\nimport 'package:nested_root/root.dart';\n\nint c() => b() + Root().value;\n",
+      );
+      final output = path.join(_temp.path, 'out_nested');
+      final result = await _obfuscate(['--src=${root.path}', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect('${result.stdout}', isNot(contains('may not be updated')));
+      final copy = path.join(output, 'copy', 'nested');
+      expect(File(path.join(copy, 'tools', 'c', 'pubspec.yaml')).readAsStringSync(), contains(path.join(copy, 'tools', 'b')));
+      expect(await _errors(path.join(copy, 'tools', 'c')), isEmpty);
+      expect(File(path.join(copy, 'tools', 'c', 'lib', 'c.dart')).readAsStringSync(), isNot(_containsWord('Root')));
     });
 
     test('reports conflicting dependency declarations', () async {
