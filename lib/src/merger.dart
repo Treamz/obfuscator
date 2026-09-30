@@ -512,6 +512,33 @@ class ProjectMerger {
     }
   }
 
+  /// Names declared at the top level of the merged file, or provided by its imports (including prefixes).
+  ///
+  Set<String> _mergedScopeNames(List<_MergedSource> sources, List<_MergedImport> imports) {
+    return {
+      for (final import in imports) ?import.prefix,
+      for (final source in sources) ...[
+        for (final declaration in source.result.unit.declarations)
+          for (final (element, _) in _declaredTopLevelElements(declaration)) _topLevelRenames[_topLevelKey(element)] ?? element.name!,
+        for (final import in source.result.libraryFragment.libraryImports)
+          if (import.prefix == null)
+            for (final name in import.namespace.definedNames2.keys) name.replaceAll('=', ''),
+      ],
+    };
+  }
+
+  /// Qualifies the references to inherited instance members with `this`, if their names become visible
+  /// at the top level of the merged file.
+  ///
+  /// An unqualified identifier resolves to a top-level declaration before an inherited member, so for example
+  /// `position` in a subclass would start referring to a top-level `position()` function of another library.
+  ///
+  void _qualifyInheritedMembers(List<_MergedSource> sources, Set<String> scopeNames) {
+    for (final source in sources) {
+      source.result.unit.accept(_ImplicitThisVisitor(merger: this, source: source, scopeNames: scopeNames));
+    }
+  }
+
   /// Adds `noSuchMethod` forwarders to the classes implementing private members of other merged libraries.
   ///
   /// A class doesn't have to implement the private members of an interface declared by another library,
@@ -1037,6 +1064,7 @@ class ProjectMerger {
     final exports = _publicExports(sources, exportedNames);
     _resolveNameClashes(sources, references, imports, usedNames, exportedNames);
     _resolveExtensionClashes(sources, usedNames);
+    _qualifyInheritedMembers(sources, _mergedScopeNames(sources, imports));
     await collection.dispose();
 
     final fileBuffer = StringBuffer();
@@ -1401,5 +1429,72 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
   void visitFunctionExpressionInvocation(analyzer_ast.FunctionExpressionInvocation node) {
     _checkOperator(node, node.element);
     super.visitFunctionExpressionInvocation(node);
+  }
+}
+
+/// Qualifies the unqualified references to inherited instance members with `this`,
+/// for the member names which are visible at the top level of the merged file.
+///
+class _ImplicitThisVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
+  _ImplicitThisVisitor({
+    required this.merger,
+    required this.source,
+    required this.scopeNames,
+  });
+
+  final ProjectMerger merger;
+
+  final _MergedSource source;
+
+  /// Names visible at the top level of the merged file.
+  ///
+  final Set<String> scopeNames;
+
+  @override
+  void visitImportDirective(analyzer_ast.ImportDirective node) {}
+
+  @override
+  void visitExportDirective(analyzer_ast.ExportDirective node) {}
+
+  @override
+  void visitComment(analyzer_ast.Comment node) {}
+
+  @override
+  void visitConstructorFieldInitializer(analyzer_ast.ConstructorFieldInitializer node) {
+    // The field name of an initializer is not an expression, only its value is visited.
+    node.expression.accept(this);
+  }
+
+  @override
+  void visitSimpleIdentifier(analyzer_ast.SimpleIdentifier node) {
+    final parent = node.parent;
+    // Only unqualified references can resolve through the implicit `this`.
+    if (parent is analyzer_ast.PrefixedIdentifier && parent.identifier == node ||
+        parent is analyzer_ast.PropertyAccess && parent.propertyName == node ||
+        parent is analyzer_ast.MethodInvocation && parent.methodName == node && (parent.target != null || parent.isCascaded) ||
+        parent is analyzer_ast.Label ||
+        parent is analyzer_ast.ConstructorName ||
+        parent is analyzer_ast.Combinator) {
+      return;
+    }
+    final element = (node.element ?? ObjectCollector.assignedElement(node))?.baseElement;
+    if (element is! analyzer_element.ExecutableElement && element is! analyzer_element.FieldElement) return;
+    if (element is analyzer_element.ExecutableElement && element.isStatic) return;
+    if (element is analyzer_element.FieldElement && element.isStatic) return;
+    final declarer = element!.enclosingElement;
+    if (declarer is! analyzer_element.InstanceElement || element is analyzer_element.ConstructorElement) return;
+    // Members declared by the enclosing declaration are found in its scope, before the top-level ones.
+    final enclosingDeclaration = node.thisOrAncestorOfType<analyzer_ast.CompilationUnitMember>();
+    final enclosingElement = enclosingDeclaration?.declaredFragment?.element;
+    if (enclosingElement == null || enclosingElement == declarer.baseElement) return;
+    final name = merger._mergedMemberName(declarer, node.name);
+    if (!scopeNames.contains(name)) return;
+    if (parent is analyzer_ast.InterpolationExpression && parent.rightBracket == null) {
+      // Simple interpolation (e.g., `$position`) is converted to `${this.position}`.
+      source.addEdit(node.offset, node.offset, '{this.', priority: 0);
+      source.addEdit(node.end, node.end, '}');
+    } else {
+      source.addEdit(node.offset, node.offset, 'this.', priority: 0);
+    }
   }
 }
