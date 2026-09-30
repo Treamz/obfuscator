@@ -215,6 +215,19 @@ class ObjectCollector {
     }
     if (base is analyzer_element.FormalParameterElement && base.isNamed) {
       final constructor = base.enclosingElement;
+      // Constructors of mixin applications (e.g., `class A = B with M;`) forward to the superclass constructors.
+      final enclosingClass = constructor?.enclosingElement;
+      if (constructor is analyzer_element.ConstructorElement &&
+          constructor.isSynthetic &&
+          enclosingClass is analyzer_element.ClassElement &&
+          enclosingClass.isMixinApplication) {
+        final superConstructor = constructor.superConstructor;
+        if (superConstructor != null) {
+          for (final parameter in superConstructor.formalParameters) {
+            if (parameter.isNamed && parameter.name == base.name) return keyFor(parameter, depth + 1);
+          }
+        }
+      }
       if (constructor is analyzer_element.ConstructorElement && constructor.isFactory) {
         final redirectedConstructor = constructor.redirectedConstructor;
         if (redirectedConstructor != null) {

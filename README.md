@@ -201,6 +201,7 @@ https://github.com/ljmatan/obfuscator/tree/main/output
 - `<out>/pubspec.yaml` — generated `pubspec.yaml`, merged from the source packages. The merged package keeps
   the name of the source package if a single one is provided, and is named `merged_app` otherwise.
 - `<out>/assets/...` — assets and fonts declared by the source packages.
+- `<out>/lib/...` — non-Dart files of the `lib` directories (e.g., resources resolved with `package:` URIs).
 - `<out>/mappings.json` — JSON map of original → obfuscated symbol names.
 
 ---
@@ -257,6 +258,9 @@ https://github.com/ljmatan/obfuscator/tree/main/output
   null safety can't be merged.
 - **Invalid sources**: Dart files with syntax errors (e.g., templates) are neither obfuscated nor merged, and
   source files must be valid UTF-8.
+- **Private interface members**: once merged, classes must implement the private members of interfaces declared
+  by other libraries. Non-nullable private getters implemented by classes with constant constructors or by enums
+  prevent the promotion of the private fields with the same name (reported with a warning).
   The `flutter: generate: true` (localizations) setting is not supported.
 - **Legal**: ensure you have the right to obfuscate and distribute any source code; follow licenses and agreements.
 

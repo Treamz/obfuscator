@@ -1,6 +1,8 @@
 import 'dart:io' as dart_io;
 
 import 'package:analyzer/dart/analysis/analysis_context_collection.dart' as analyzer_context;
+import 'package:analyzer/dart/analysis/utilities.dart' as analyzer_utilities;
+import 'package:analyzer/dart/ast/ast.dart' as analyzer_ast;
 import 'package:args/args.dart' as args;
 import 'package:dart_style/dart_style.dart' as dart_style;
 import 'package:path/path.dart' as path;
@@ -558,6 +560,7 @@ class Configuration {
         originalDirectory: package.sourceDirectory.path,
         keepWorkspaceResolution: false,
       );
+      _updateRelativeUris(package);
       _findNestedPackages(package, package.copyDirectory);
       for (final nestedDirectory in package.nestedPackageDirectories) {
         _updateCopiedPubspec(
@@ -623,6 +626,48 @@ class Configuration {
       if (contents is Map && contents.containsKey('workspace')) return true;
     }
     return false;
+  }
+
+  /// Converts the relative URIs of the copied [package] files which point outside of the package
+  /// (e.g., `import '../../shared/util.dart';` in `bin`) to absolute ones, as the package is moved.
+  ///
+  void _updateRelativeUris(SourcePackage package) {
+    for (final file in package.copyDirectory.listSync(recursive: true, followLinks: false)) {
+      if (file is! dart_io.File || !file.path.endsWith('.dart') || file.path.contains('${path.separator}.dart_tool')) continue;
+      final String contents;
+      try {
+        contents = file.readAsStringSync();
+      } on dart_io.FileSystemException {
+        // Files which aren't valid UTF-8 are reported by the analysis.
+        continue;
+      }
+      final originalDirectory = path.join(
+        package.sourceDirectory.path,
+        path.relative(path.dirname(file.path), from: package.copyDirectory.path),
+      );
+      final unit = analyzer_utilities.parseString(content: contents, throwIfDiagnostics: false).unit;
+      final edits = <({int offset, int end, String text})>[];
+      for (final directive in unit.directives.whereType<analyzer_ast.UriBasedDirective>()) {
+        final literals = [
+          directive.uri,
+          if (directive is analyzer_ast.NamespaceDirective)
+            for (final configuration in directive.configurations) configuration.uri,
+        ];
+        for (final literal in literals) {
+          final value = literal.stringValue;
+          if (value == null || Uri.tryParse(value)?.hasScheme != false) continue;
+          final target = path.normalize(path.join(originalDirectory, value));
+          if (path.isWithin(package.sourceDirectory.path, target)) continue;
+          edits.add((offset: literal.offset, end: literal.end, text: "'${Uri.file(target)}'"));
+        }
+      }
+      if (edits.isEmpty) continue;
+      var updated = contents;
+      for (final edit in edits.reversed) {
+        updated = updated.replaceRange(edit.offset, edit.end, edit.text);
+      }
+      file.writeAsStringSync(updated);
+    }
   }
 
   /// Records the packages nested within the [directory] of the copied [package].

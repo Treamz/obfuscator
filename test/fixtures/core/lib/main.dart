@@ -1,3 +1,4 @@
+import 'package:core/alias_ctor.dart';
 import 'package:core/api.dart';
 import 'package:core/callbacks.dart';
 import 'package:core/core_types.dart';
@@ -18,6 +19,7 @@ import 'package:core/supers.dart';
 
 void main() {
   for (final line in [
+    ...aliasReport(),
     ...apiReport(),
     ...callbacksReport(),
     ...coreTypesReport(),

@@ -525,6 +525,61 @@ void main() {
       expect('${result.stderr}', contains('is not a valid UTF-8 file'));
     });
 
+    test('qualifies inherited members captured by dart:core names imported only with prefixes', () async {
+      final root = Directory(path.join(_temp.path, 'core_prefixed'));
+      File(path.join(root.path, 'pubspec.yaml'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync('name: core_prefixed\nenvironment:\n  sdk: ^3.10.0\n');
+      File(path.join(root.path, 'lib', 'main.dart'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync(r'''
+import 'dart:core' as $core;
+
+class Logger {
+  final $core.List<$core.String> lines = [];
+
+  void print($core.Object? value) => lines.add('logged: $value');
+}
+
+class Service extends Logger {
+  void run() {
+    print('started');
+  }
+}
+
+void main() {
+  final service = Service()..run();
+  $core.print(service.lines);
+}
+''');
+      await _run('dart', ['pub', 'get', '--offline'], workingDirectory: root.path);
+      final output = path.join(_temp.path, 'out_core_prefixed');
+      final result = await _obfuscate(['--src=${root.path}', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(await _runDart(output, 'lib/merged.dart'), '[logged: started]\n');
+    });
+
+    test('keeps relative imports pointing outside of the package valid in the copy', () async {
+      final root = Directory(path.join(_temp.path, 'relative_outside', 'pkg'));
+      File(path.join(root.parent.path, 'shared', 'util.dart'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync('String shout(String value) => value.toUpperCase();\n');
+      File(path.join(root.path, 'pubspec.yaml'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync('name: relative_outside\nenvironment:\n  sdk: ^3.10.0\n');
+      File(path.join(root.path, 'lib', 'main.dart'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync('class Greeter {}\n\nvoid main() => print(Greeter());\n');
+      File(path.join(root.path, 'bin', 'tool.dart'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync("import '../../shared/util.dart';\n\nvoid main() => print(shout('hi'));\n");
+      await _run('dart', ['pub', 'get', '--offline'], workingDirectory: root.path);
+      final output = path.join(_temp.path, 'out_relative_outside');
+      final result = await _obfuscate(['--src=${root.path}', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(await _runDart(path.join(output, 'copy', 'pkg'), 'bin/tool.dart'), 'HI\n');
+    });
+
     test('reports conflicting dependency declarations', () async {
       final root = Directory(path.join(_temp.path, 'conflict'));
       for (final name in ['dep_one', 'dep_two']) {
