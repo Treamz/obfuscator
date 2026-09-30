@@ -252,8 +252,11 @@ https://github.com/ljmatan/obfuscator/tree/main/output
   prefixes are renamed, and extension member invocations which could resolve differently are made explicit.
   Library-level annotations, conditional imports of first-party libraries, and extension operators, cascaded
   extension invocations or extension getters in object patterns (reported with a warning) may need manual
-  adjustments. Libraries opted into older language versions (`// @dart=2.19`) are adapted to the language
-  version of the merged file, while libraries without null safety can't be merged.
+  adjustments. Libraries of older language versions (e.g., `// @dart=2.19`) are adapted to the language version
+  of the merged file for class modifiers and wildcard variables (reported with a warning), while libraries without
+  null safety can't be merged.
+- **Invalid sources**: Dart files with syntax errors (e.g., templates) are neither obfuscated nor merged, and
+  source files must be valid UTF-8.
   The `flutter: generate: true` (localizations) setting is not supported.
 - **Legal**: ensure you have the right to obfuscate and distribute any source code; follow licenses and agreements.
 

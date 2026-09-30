@@ -1,3 +1,4 @@
+import 'dart:convert' as dart_convert;
 import 'dart:io' as dart_io;
 
 import 'package:analyzer/dart/analysis/analysis_context.dart' as analyzer_context;
@@ -9,6 +10,7 @@ import 'package:analyzer/dart/ast/visitor.dart' as analyzer_visitor;
 import 'package:analyzer/dart/element/element.dart' as analyzer_element;
 import 'package:analyzer/dart/element/type.dart' as analyzer_type;
 import 'package:analyzer/diagnostic/diagnostic.dart' as analyzer_diagnostic;
+import 'package:analyzer/error/error.dart' as analyzer_error;
 import 'package:obfuscator/src/config.dart';
 import 'package:path/path.dart' as path;
 
@@ -303,20 +305,26 @@ class ObjectCollector {
   ///
   static List<String> listDartFiles(SourcePackage package) {
     final files = <String>[];
-    void visit(dart_io.Directory directory) {
+    void visit(dart_io.Directory directory, {required bool isLibrary}) {
       for (final entity in directory.listSync(followLinks: false)) {
-        if (path.basename(entity.path).startsWith('.')) continue;
+        final name = path.basename(entity.path);
+        // Hidden entries (e.g., `.dart_tool`) are skipped, unless they are a part of the `lib` sources.
+        if (name.startsWith('.') && (!isLibrary || name == '.dart_tool')) continue;
         if (entity is dart_io.Directory) {
-          visit(entity);
+          visit(entity, isLibrary: isLibrary || name == 'lib');
         } else if (entity is dart_io.File && entity.path.endsWith('.dart')) {
           files.add(entity.path);
         }
       }
     }
 
-    visit(package.copyDirectory);
+    visit(package.copyDirectory, isLibrary: false);
     return files..sort();
   }
+
+  /// Files which are not valid Dart code (e.g., templates), which are neither obfuscated nor merged.
+  ///
+  final invalidFiles = <String>{};
 
   /// Whether the [filePath] belongs to the `lib` directory of the copied [package] itself,
   /// rather than to another directory or to a nested package.
@@ -332,9 +340,19 @@ class ObjectCollector {
     final errors = <String>[];
     for (final package in _configuration.packages) {
       for (final filePath in listDartFiles(package)) {
+        try {
+          dart_convert.utf8.decode(dart_io.File(filePath).readAsBytesSync());
+        } on FormatException {
+          throw ConfigurationException('"$filePath" is not a valid UTF-8 file, which is required for its analysis.');
+        }
         final result = await contextFor(_configuration.analysisContextCollection, filePath).currentSession.getResolvedUnit(filePath);
         if (result is! analyzer_results.ResolvedUnitResult) {
           throw ConfigurationException('Unable to analyze "$filePath": ${result.runtimeType}.');
+        }
+        if (result.diagnostics.any((diagnostic) => diagnostic.diagnosticCode.type == analyzer_error.DiagnosticType.SYNTACTIC_ERROR)) {
+          print('Warning: "$filePath" is not valid Dart code (e.g., a template), it is neither obfuscated nor merged.');
+          invalidFiles.add(filePath);
+          continue;
         }
         for (final diagnostic in result.diagnostics) {
           if (diagnostic.severity == analyzer_diagnostic.Severity.error) {
@@ -480,6 +498,11 @@ class ObjectCollector {
     for (final element in declarations.interfaces) {
       for (final member in _declaredMembers(element)) {
         addMember(element, member.name);
+        // All of the private members with the same name in a library are renamed together, as they determine
+        // whether a private field can be promoted (e.g., a getter of an unrelated class prevents it).
+        if (member.name.startsWith('_')) {
+          families.union(memberKey(element, member.name), '${element.library.uri}#private:${member.name}');
+        }
       }
       // Instance members with the same name, declared by the class or any of its supertypes, are related.
       // This includes the members inherited from one supertype, implementing the members of another one.
@@ -758,6 +781,15 @@ class _DynamicAccessVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
   void visitMethodInvocation(analyzer_ast.MethodInvocation node) {
     _record(node.methodName, node.realTarget);
     super.visitMethodInvocation(node);
+  }
+
+  @override
+  void visitNamedExpression(analyzer_ast.NamedExpression node) {
+    // A named argument of a dynamic invocation (e.g., of a `Function` value) can't be matched to its parameter,
+    // which may be an initializing formal of a field (e.g., `builders['user']!(id: 7)` for `User.new`).
+    final label = node.name.label;
+    if (label.element == null && node.parent is analyzer_ast.ArgumentList) names.add(label.name);
+    super.visitNamedExpression(node);
   }
 }
 

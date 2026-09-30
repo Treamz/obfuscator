@@ -3,3 +3,6 @@ description: Fixture covering merging edge cases.
 publish_to: none
 environment:
   sdk: ^3.10.0
+dev_dependencies:
+  devdep:
+    path: ../deps/devdep

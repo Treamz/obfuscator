@@ -9,6 +9,7 @@ import 'package:core/overrides.dart';
 import 'package:core/patterns.dart';
 import 'package:core/platform_report.dart';
 import 'package:core/private_one.dart';
+import 'package:core/promotion.dart';
 import 'package:core/private_two.dart';
 import 'package:core/redirect.dart';
 import 'package:core/shadow.dart';
@@ -28,6 +29,7 @@ void main() {
     ...patternsReport(),
     ...platformReport(),
     ...privateOneReport(),
+    ...promotionReport(),
     ...privateTwoReport(),
     ...redirectReport(),
     ...shadowReport(),

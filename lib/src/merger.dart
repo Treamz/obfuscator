@@ -166,7 +166,7 @@ class ProjectMerger {
     final sources = <_MergedSource>[];
     for (final package in _configuration.packages) {
       for (final filePath in ObjectCollector.listDartFiles(package)) {
-        if (!ObjectCollector.isLibraryFile(package, filePath)) continue;
+        if (!ObjectCollector.isLibraryFile(package, filePath) || _collector.invalidFiles.contains(filePath)) continue;
         final context = ObjectCollector.contextFor(collection, filePath);
         final result = await context.currentSession.getResolvedUnit(filePath);
         if (result is! analyzer_results.ResolvedUnitResult) {
@@ -186,6 +186,8 @@ class ProjectMerger {
   ) {
     final references = <_TopLevelReference>[];
     for (final source in sources) {
+      final scriptTag = source.result.unit.scriptTag;
+      if (scriptTag != null) source.addEdit(scriptTag.offset, scriptTag.end, '');
       for (final directive in source.result.unit.directives) {
         if (directive is analyzer_ast.ImportDirective) {
           final importedLibrary = directive.libraryImport?.importedLibrary;
@@ -368,6 +370,11 @@ class ProjectMerger {
     }
     return exports;
   }
+
+  /// Names used as for-in loop identifiers (e.g., `for (current in values)`), which can't be qualified,
+  /// mapped to the keys of the top-level declarations they refer to.
+  ///
+  final _forInNames = <String, Set<String>>{};
 
   /// Top-level declarations referenced through removed import prefixes, where their names are shadowed.
   ///
@@ -572,7 +579,10 @@ class ProjectMerger {
   /// The classes of libraries older than Dart 3.0 which are used as mixins are declared as `mixin class`,
   /// as required by Dart 3.0.
   ///
-  void _adaptLanguageVersions(List<_MergedSource> sources) {
+  void _adaptLanguageVersions(List<_MergedSource> sources, Set<String> usedNames) {
+    final mergedVersion = _highestLowerBound(_configuration.packages.map((package) => package.pubspec.environment['sdk']));
+    final wildcardVersion = pub_semver.Version(3, 7, 0);
+    final reportedVersions = <String>{};
     final mixinKeys = <String>{
       for (final source in sources)
         for (final declaration in source.result.unit.declarations)
@@ -588,6 +598,28 @@ class ProjectMerger {
       final versionToken = source.result.unit.languageVersionToken;
       if (versionToken != null) source.addEdit(versionToken.offset, versionToken.end, '');
       final version = source.result.libraryElement.languageVersion.effective;
+      if (mergedVersion != null && version < mergedVersion && reportedVersions.add('${source.package.name} $version')) {
+        print(
+          'Warning: the ${source.package.name} package uses the language version $version, while the merged file uses '
+          '$mergedVersion. Wildcard variables and class modifiers are adapted, other language changes are not.',
+        );
+      }
+      if (mergedVersion != null && version < wildcardVersion && mergedVersion >= wildcardVersion) {
+        // Before Dart 3.7, `_` declares a regular variable, which can't be referenced once it's a wildcard.
+        var index = 0;
+        String newName() {
+          while (usedNames.contains('_wildcard$index')) {
+            index++;
+          }
+          usedNames.add('_wildcard$index');
+          return '_wildcard$index';
+        }
+
+        final visitor = _WildcardVisitor(source: source, newName: newName);
+        source.result.unit.accept(visitor);
+        visitor.isRenamingReferences = true;
+        source.result.unit.accept(visitor);
+      }
       if (version.major >= 3) continue;
       if (version < pub_semver.Version(2, 12, 0)) {
         print('Warning: ${source.filePath} uses the language version $version without null safety, which can\'t be merged.');
@@ -648,6 +680,33 @@ class ProjectMerger {
               for (final key in _instanceMemberKeys(supertype.element, concrete: false))
                 if (key.substring(key.indexOf(':') + 1).startsWith('_')) key,
         };
+        // Whether any declaration of a required getter has a nullable type.
+        bool isNullableGetter(String name) {
+          for (final supertype in element.allSupertypes) {
+            for (final field in supertype.element.fields) {
+              if (field.name != null && _mergedMemberName(supertype.element, field.name!) == name) {
+                if (source.result.typeSystem.isNullable(field.type)) return true;
+              }
+            }
+            for (final getter in supertype.element.getters) {
+              if (getter.name != null && _mergedMemberName(supertype.element, getter.name!) == name) {
+                if (source.result.typeSystem.isNullable(getter.returnType)) return true;
+              }
+            }
+          }
+          return false;
+        }
+
+        // Missing getters are implemented without preventing the promotion of private fields: `late final Never`
+        // fields throw the original error, while `final Null` fields (for classes with constant constructors,
+        // which can't declare late fields) return `null` instead of throwing it.
+        String getterStub(String name, {required bool canBeLate}) {
+          final error = 'throw NoSuchMethodError.withInvocation(this, Invocation.getter(#$name))';
+          if (canBeLate) return '\n  @override\n  late final Never $name = $error;\n';
+          if (isNullableGetter(name)) return '\n  @override\n  final Null $name = null;\n';
+          return '\n  @override\n  Never get $name => $error;\n';
+        }
+
         if (required.isEmpty) continue;
         // Concrete members of the superclass chain (excluding `Object`) and of the applied mixins.
         final concrete = <String>{};
@@ -667,18 +726,20 @@ class ProjectMerger {
           );
           final members = StringBuffer();
           for (final key in missing.where((key) => key.startsWith('get:'))) {
-            final name = key.substring(4);
-            final error = 'throw NoSuchMethodError.withInvocation(this, Invocation.getter(#$name))';
-            // Late fields can't be declared by classes with constant constructors.
-            members.write(
-              hasConstConstructor ? '\n  @override\n  Never get $name => $error;\n' : '\n  @override\n  late final Never $name = $error;\n',
-            );
+            members.write(getterStub(key.substring(4), canBeLate: !hasConstConstructor));
           }
           if (!hasNoSuchMethod && missing.any((key) => !key.startsWith('get:'))) {
             members.write('\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n');
           }
           source.addEdit(declaration.rightBracket.offset, declaration.rightBracket.offset, members.toString());
           continue;
+        }
+        if (declaration is analyzer_ast.EnumDeclaration) {
+          final getters = missing.where((key) => key.startsWith('get:'));
+          if (getters.isNotEmpty) {
+            _addEnumMembers(source, declaration, [for (final key in getters) getterStub(key.substring(4), canBeLate: false)].join());
+          }
+          if (missing.every((key) => key.startsWith('get:'))) continue;
         }
         if (hasNoSuchMethod) continue;
         switch (declaration) {
@@ -847,10 +908,14 @@ class ProjectMerger {
     for (final entry in declarations.entries) {
       final name = entry.value.name!;
       final isExportedElsewhere = exportedNames.containsKey(name) && !_isMergedLibrary(exportedNames[name]!.library);
+      // A for-in loop identifier referring to a member would be captured by a top-level declaration.
+      final forInKeys = _forInNames[name];
+      final capturesForIn = forInKeys != null && !forInKeys.contains(entry.key);
       if (declaredNames.add(name) &&
           !externalReferencesByName.containsKey(name) &&
           !prefixes.contains(name) &&
           !isExportedElsewhere &&
+          !capturesForIn &&
           !_capturedTopLevelKeys.contains(entry.key)) {
         continue;
       }
@@ -868,7 +933,17 @@ class ProjectMerger {
       for (final declaration in source.result.unit.declarations) {
         for (final (element, token) in _declaredTopLevelElements(declaration)) {
           final newName = renames[_topLevelKey(element)];
-          if (newName != null) source.addEdit(token.offset, token.end, newName);
+          if (newName == null) continue;
+          source.addEdit(token.offset, token.end, newName);
+          // The string representation of enum values includes the enum name, which is kept.
+          if (declaration is analyzer_ast.EnumDeclaration &&
+              !declaration.members.any((member) => member is analyzer_ast.MethodDeclaration && member.name.lexeme == 'toString')) {
+            _addEnumMembers(
+              source,
+              declaration,
+              "\n  @override\n  String toString() => '${element.name}.\$name';\n",
+            );
+          }
         }
       }
     }
@@ -923,6 +998,14 @@ class ProjectMerger {
         }
       }
     }
+  }
+
+  /// Adds the [members] to an enum [declaration], separating them from the values if needed.
+  ///
+  static void _addEnumMembers(_MergedSource source, analyzer_ast.EnumDeclaration declaration, String members) {
+    final offset = declaration.rightBracket.offset;
+    if (declaration.semicolon == null) source.addEdit(offset, offset, ';', priority: 0);
+    source.addEdit(offset, offset, members);
   }
 
   /// Returns the URI of an import through which the [element] is referenced by the [source].
@@ -985,11 +1068,15 @@ class ProjectMerger {
       );
     final buffer = StringBuffer();
     var position = 0;
+    var isRemoval = false;
     for (final edit in edits) {
-      // Edits are applied in a single pass, in the order of their offsets, and must not overlap.
+      // Edits are applied in a single pass, in the order of their offsets, and must not overlap,
+      // except for the edits within removed code (e.g., references in the comments of removed directives).
       if (edit.offset < position) {
+        if (isRemoval && edit.end <= position) continue;
         throw StateError('Overlapping merge edits in ${source.filePath} at offset ${edit.offset}.');
       }
+      isRemoval = edit.text.isEmpty && edit.end > edit.offset;
       buffer
         ..write(contents.substring(position, edit.offset))
         ..write(edit.text);
@@ -1128,7 +1215,7 @@ class ProjectMerger {
 
   /// Generates a new `pubspec.yaml` file from the source package specifications.
   ///
-  void _generateMergedPubspecFile() {
+  void _generateMergedPubspecFile(Set<String> importedPackages) {
     final packages = _configuration.packages;
     final sourcePackageNames = _configuration.sourcePackages.toSet();
     Map<String, Object?> mergeDependencies(Map<String, pubspec_parse.Dependency> Function(pubspec_parse.Pubspec) section) {
@@ -1166,6 +1253,13 @@ class ProjectMerger {
     final flutterMinimum = _highestLowerBound(packages.map((package) => package.pubspec.environment['flutter']));
     if (flutterMinimum != null) environment['flutter'] = '>=$flutterMinimum';
     final dependencies = mergeDependencies((pubspec) => pubspec.dependencies);
+    // Development dependencies imported by the merged code are regular dependencies of the merged package.
+    final importedDevDependencies = mergeDependencies((pubspec) => pubspec.devDependencies)
+      ..removeWhere((name, _) => !importedPackages.contains(name) || dependencies.containsKey(name));
+    for (final name in importedDevDependencies.keys) {
+      print('Warning: the development dependency "$name" is imported by the merged code, it is added as a dependency.');
+    }
+    dependencies.addAll(importedDevDependencies);
     // Development dependencies are not included, as the merged package contains no tests or tools, and they may
     // depend on the merged package itself (e.g., `test` on `args`), which would conflict with it.
     final dependencyOverrides = mergeDependencies((pubspec) => pubspec.dependencyOverrides);
@@ -1223,7 +1317,7 @@ class ProjectMerger {
     _resolvePrefixClashes(sources, imports, usedNames);
     _resolvePrivateMemberClashes(sources, usedNames);
     _implementPrivateMembers(sources, usedNames);
-    _adaptLanguageVersions(sources);
+    _adaptLanguageVersions(sources, usedNames);
     final exportedNames = <String, analyzer_element.Element>{};
     final exports = _publicExports(sources, exportedNames);
     _resolveNameClashes(sources, references, imports, usedNames, exportedNames);
@@ -1267,7 +1361,10 @@ class ProjectMerger {
     await _configuration.outputMergedFile.writeAsString(formattedCode);
 
     // Record the merged `pubspec.yaml` file and run package setup.
-    _generateMergedPubspecFile();
+    _generateMergedPubspecFile({
+      for (final directive in [...importTexts, ...exports])
+        if (RegExp(r'package:([A-Za-z0-9_]+)/').firstMatch(directive)?.group(1) case final name?) name,
+    });
     try {
       await Configuration.runPubGet(
         directory: _configuration.outputDirectory,
@@ -1443,6 +1540,16 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
   @override
   void visitSimpleIdentifier(analyzer_ast.SimpleIdentifier node) {
     final element = node.element;
+    final forEachParts = node.parent;
+    if (forEachParts is analyzer_ast.ForEachPartsWithIdentifier &&
+        forEachParts.identifier == node &&
+        element is! analyzer_element.LocalVariableElement &&
+        element is! analyzer_element.FormalParameterElement) {
+      final topLevelElement = ProjectMerger._topLevelElement(element);
+      merger._forInNames.putIfAbsent(node.name, () => {}).addAll([
+        if (topLevelElement != null) ProjectMerger._topLevelKey(topLevelElement),
+      ]);
+    }
     if (element is analyzer_element.PrefixElement) {
       final parent = node.parent;
       if (parent is analyzer_ast.PrefixedIdentifier && parent.prefix == node) {
@@ -1546,6 +1653,15 @@ class _PrivateMemberVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
 
   @override
   void visitExportDirective(analyzer_ast.ExportDirective node) {}
+
+  @override
+  void visitLibraryDirective(analyzer_ast.LibraryDirective node) {}
+
+  @override
+  void visitPartDirective(analyzer_ast.PartDirective node) {}
+
+  @override
+  void visitPartOfDirective(analyzer_ast.PartOfDirective node) {}
 
   @override
   void visitMethodDeclaration(analyzer_ast.MethodDeclaration node) {
@@ -1704,6 +1820,12 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
         parent is analyzer_ast.Label) {
       return;
     }
+    if (parent is analyzer_ast.ForEachPartsWithIdentifier) {
+      // For-in loop identifiers can't be applied explicitly.
+      final element = node.element ?? ObjectCollector.assignedElement(node);
+      if (_extensionOf(element) != null && memberNames.contains(node.name)) _warn(node, node.name);
+      return;
+    }
     _override(
       node: node,
       element: node.element ?? ObjectCollector.assignedElement(node),
@@ -1728,6 +1850,15 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
 
   @override
   void visitExportDirective(analyzer_ast.ExportDirective node) {}
+
+  @override
+  void visitLibraryDirective(analyzer_ast.LibraryDirective node) {}
+
+  @override
+  void visitPartDirective(analyzer_ast.PartDirective node) {}
+
+  @override
+  void visitPartOfDirective(analyzer_ast.PartOfDirective node) {}
 
   @override
   void visitMethodInvocation(analyzer_ast.MethodInvocation node) {
@@ -1824,6 +1955,15 @@ class _ImplicitThisVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
   void visitExportDirective(analyzer_ast.ExportDirective node) {}
 
   @override
+  void visitLibraryDirective(analyzer_ast.LibraryDirective node) {}
+
+  @override
+  void visitPartDirective(analyzer_ast.PartDirective node) {}
+
+  @override
+  void visitPartOfDirective(analyzer_ast.PartOfDirective node) {}
+
+  @override
   void visitComment(analyzer_ast.Comment node) {}
 
   @override
@@ -1856,6 +1996,15 @@ class _ImplicitThisVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
     if (enclosingElement == null || enclosingElement == declarer.baseElement) return;
     final name = merger._mergedMemberName(declarer, node.name);
     if (!scopeNames.contains(name) || merger._explicitExtensionOffsets.contains((source, node.offset))) return;
+    if (parent is analyzer_ast.ForEachPartsWithIdentifier) {
+      // For-in loop identifiers can't be qualified, first-party top-level declarations are renamed instead.
+      final location = source.result.lineInfo.getLocation(node.offset);
+      print(
+        'Warning: ${source.filePath}:${location.lineNumber}: the "${node.name}" loop variable may refer to an imported '
+        'declaration in the merged file.',
+      );
+      return;
+    }
     if (parent is analyzer_ast.InterpolationExpression && parent.rightBracket == null) {
       // Simple interpolation (e.g., `$position`) is converted to `${this.position}`.
       source.addEdit(node.offset, node.offset, '{this.', priority: 0);
@@ -1875,5 +2024,89 @@ class _PatternVariableCollector extends analyzer_visitor.RecursiveAstVisitor<voi
   void visitDeclaredVariablePattern(analyzer_ast.DeclaredVariablePattern node) {
     names.add(node.name);
     super.visitDeclaredVariablePattern(node);
+  }
+}
+
+/// Renames the local variables and parameters named `_` of libraries older than Dart 3.7, where they were
+/// regular variables, which would become non-binding wildcards in the merged file.
+///
+/// The declarations are renamed in the first pass, and their references with [isRenamingReferences].
+///
+class _WildcardVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
+  _WildcardVisitor({
+    required this.source,
+    required this.newName,
+  });
+
+  final _MergedSource source;
+
+  final String Function() newName;
+
+  final _renames = <analyzer_element.Element, String>{};
+
+  bool isRenamingReferences = false;
+
+  void _declare(analyzer_element.Element? element, analyzer_token.Token? token) {
+    if (isRenamingReferences || element == null || token == null || token.lexeme != '_') return;
+    source.addEdit(token.offset, token.end, _renames.putIfAbsent(element, newName));
+  }
+
+  @override
+  void visitImportDirective(analyzer_ast.ImportDirective node) {}
+
+  @override
+  void visitExportDirective(analyzer_ast.ExportDirective node) {}
+
+  @override
+  void visitVariableDeclaration(analyzer_ast.VariableDeclaration node) {
+    final element = node.declaredFragment?.element;
+    if (element is analyzer_element.LocalVariableElement) _declare(element, node.name);
+    super.visitVariableDeclaration(node);
+  }
+
+  @override
+  void visitSimpleFormalParameter(analyzer_ast.SimpleFormalParameter node) {
+    // Parameters of function types don't declare variables.
+    if (node.thisOrAncestorOfType<analyzer_ast.GenericFunctionType>() == null) {
+      _declare(node.declaredFragment?.element, node.name);
+    }
+    super.visitSimpleFormalParameter(node);
+  }
+
+  @override
+  void visitFunctionTypedFormalParameter(analyzer_ast.FunctionTypedFormalParameter node) {
+    _declare(node.declaredFragment?.element, node.name);
+    super.visitFunctionTypedFormalParameter(node);
+  }
+
+  @override
+  void visitCatchClauseParameter(analyzer_ast.CatchClauseParameter node) {
+    _declare(node.declaredFragment?.element, node.name);
+    super.visitCatchClauseParameter(node);
+  }
+
+  @override
+  void visitDeclaredIdentifier(analyzer_ast.DeclaredIdentifier node) {
+    _declare(node.declaredFragment?.element, node.name);
+    super.visitDeclaredIdentifier(node);
+  }
+
+  @override
+  void visitDeclaredVariablePattern(analyzer_ast.DeclaredVariablePattern node) {
+    _declare(node.declaredFragment?.element, node.name);
+    super.visitDeclaredVariablePattern(node);
+  }
+
+  @override
+  void visitFunctionDeclaration(analyzer_ast.FunctionDeclaration node) {
+    if (node.parent is analyzer_ast.FunctionDeclarationStatement) _declare(node.declaredFragment?.element, node.name);
+    super.visitFunctionDeclaration(node);
+  }
+
+  @override
+  void visitSimpleIdentifier(analyzer_ast.SimpleIdentifier node) {
+    if (!isRenamingReferences || node.name != '_') return;
+    final newName = _renames[node.element ?? ObjectCollector.assignedElement(node)];
+    if (newName != null) source.addEdit(node.offset, node.end, newName);
   }
 }

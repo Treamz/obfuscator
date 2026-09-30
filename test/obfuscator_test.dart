@@ -260,11 +260,20 @@ void main() {
 
   group('merge edge cases fixture', () {
     test('keeps the program valid and its behaviour unchanged', () async {
+      _copy(Directory(path.join(_fixtures, 'deps')), Directory(path.join(_temp.path, 'src', 'deps')));
       final source = await _prepareFixture('merge_edge');
       final output = path.join(_temp.path, 'out_merge_edge');
       final result = await _obfuscate(['--src=$source', '--out=$output', '--seed=4']);
       expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
       await _verifyOutput(source: source, copy: path.join(output, 'copy', 'merge_edge'), output: output);
+      // Invalid Dart files (e.g., templates) are neither obfuscated nor merged.
+      final template = path.join('lib', 'templates', 'widget.dart');
+      expect(
+        File(path.join(output, 'copy', 'merge_edge', template)).readAsStringSync(),
+        File(path.join(source, template)).readAsStringSync(),
+      );
+      expect(File(path.join(output, 'lib', 'merged.dart')).readAsStringSync(), isNot(contains('{{name}}')));
+      expect(File(path.join(output, 'pubspec.yaml')).readAsStringSync(), contains('devdep'));
     });
   });
 
@@ -504,6 +513,16 @@ void main() {
       expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
       expect(File(path.join(output, 'lib', 'shared_one.dart')).existsSync(), isFalse);
       expect(File(path.join(output, 'lib', 'data.json')).existsSync(), isTrue);
+    });
+
+    test('reports source files which are not valid UTF-8', () async {
+      final package = await _prepareFixture('multi', name: 'encoding');
+      final root = path.join(package, 'one', 'shared');
+      File(path.join(root, 'lib', 'latin1.dart')).writeAsBytesSync([...'// Caf'.codeUnits, 0xE9, 10, ...'int latin = 1;\n'.codeUnits]);
+      final output = path.join(_temp.path, 'out_encoding');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, isNot(0));
+      expect('${result.stderr}', contains('is not a valid UTF-8 file'));
     });
 
     test('reports conflicting dependency declarations', () async {
