@@ -2,6 +2,7 @@ import 'a.dart';
 import 'api_export.dart';
 import 'b.dart';
 import 'c.dart';
+import 'capture.dart';
 import 'd.dart';
 import 'e.dart';
 import 'ext_object.dart';
@@ -21,7 +22,7 @@ import 'gen.dart';
 import 'route.dart';
 
 Future<void> main() async {
-  for (final line in [...aReport(), ...apiExportReport(), ...bReport(), ...cReport(), ...dReport(), ...eReport(), ...extObjectReport(), ...extStringReport(), ...fReport(), ...frameReport(), ...positionReport(), ...await gReport(), ...hReport(), ...ifaceReport(), ...kReport(), ...lReport(), ...privateReport(), ...protoReport(), ...genReport(), ...routeReport(), await deferredValue()]) {
+  for (final line in [...aReport(), ...apiExportReport(), ...bReport(), ...cReport(), ...captureReport(), ...dReport(), ...eReport(), ...extObjectReport(), ...extStringReport(), ...fReport(), ...frameReport(), ...positionReport(), ...await gReport(), ...hReport(), ...ifaceReport(), ...kReport(), ...lReport(), ...privateReport(), ...protoReport(), ...genReport(), ...routeReport(), await deferredValue()]) {
     print(line);
   }
 }

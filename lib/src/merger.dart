@@ -364,6 +364,10 @@ class ProjectMerger {
     return exports;
   }
 
+  /// Top-level declarations referenced through removed import prefixes, where their names are shadowed.
+  ///
+  final _capturedTopLevelKeys = <String>{};
+
   /// New names of the top-level declarations renamed to avoid clashes, mapped by their keys.
   ///
   final _topLevelRenames = <String, String>{};
@@ -713,7 +717,11 @@ class ProjectMerger {
     for (final entry in declarations.entries) {
       final name = entry.value.name!;
       final isExportedElsewhere = exportedNames.containsKey(name) && !_isMergedLibrary(exportedNames[name]!.library);
-      if (declaredNames.add(name) && !externalReferencesByName.containsKey(name) && !prefixes.contains(name) && !isExportedElsewhere) {
+      if (declaredNames.add(name) &&
+          !externalReferencesByName.containsKey(name) &&
+          !prefixes.contains(name) &&
+          !isExportedElsewhere &&
+          !_capturedTopLevelKeys.contains(entry.key)) {
         continue;
       }
       var index = 1;
@@ -1166,11 +1174,99 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
   ///
   /// Returns whether the prefix was removed.
   ///
-  bool _removePrefix(analyzer_token.Token prefix, analyzer_token.Token period, analyzer_element.Element? element) {
+  bool _removePrefix(
+    analyzer_token.Token prefix,
+    analyzer_token.Token period,
+    analyzer_element.Element? element,
+    analyzer_ast.AstNode reference,
+    String name,
+  ) {
     final library = element?.library;
     if (!merger._isMergedLibrary(library)) return false;
     source.addEdit(prefix.offset, period.end, '');
+    // Without the prefix, the name could be captured by a declaration in scope (e.g., a class member).
+    final topLevelElement = ProjectMerger._topLevelElement(element);
+    if (topLevelElement != null && _isShadowed(reference, name)) {
+      merger._capturedTopLevelKeys.add(ProjectMerger._topLevelKey(topLevelElement));
+    }
     return true;
+  }
+
+  /// Whether a declaration named [name] is in the lexical scope of the [reference], below the top level.
+  ///
+  static bool _isShadowed(analyzer_ast.AstNode reference, String name) {
+    bool declares(Iterable<analyzer_token.Token?> tokens) => tokens.any((token) => token?.lexeme == name);
+    Iterable<analyzer_token.Token?> parameterNames(analyzer_ast.FormalParameterList? list) => [
+      for (final parameter in list?.parameters ?? const <analyzer_ast.FormalParameter>[]) parameter.name,
+    ];
+    Iterable<analyzer_token.Token?> typeParameterNames(analyzer_ast.TypeParameterList? list) => [
+      for (final parameter in list?.typeParameters ?? const <analyzer_ast.TypeParameter>[]) parameter.name,
+    ];
+    Iterable<analyzer_token.Token> patternVariables(analyzer_ast.AstNode? node) {
+      final collector = _PatternVariableCollector();
+      node?.accept(collector);
+      return collector.names;
+    }
+
+    for (analyzer_ast.AstNode? node = reference.parent; node != null; node = node.parent) {
+      final isShadowing = switch (node) {
+        analyzer_ast.ClassDeclaration(:final typeParameters) ||
+        analyzer_ast.MixinDeclaration(:final typeParameters) ||
+        analyzer_ast.ExtensionDeclaration(:final typeParameters) => declares([
+          ...typeParameterNames(typeParameters),
+          ...ProjectMerger._memberNames(node as analyzer_ast.CompilationUnitMember),
+        ]),
+        analyzer_ast.EnumDeclaration(:final typeParameters, :final constants) => declares([
+          ...typeParameterNames(typeParameters),
+          ...ProjectMerger._memberNames(node),
+          for (final constant in constants) constant.name,
+        ]),
+        analyzer_ast.ExtensionTypeDeclaration(:final typeParameters) => declares([
+          ...typeParameterNames(typeParameters),
+          ...ProjectMerger._memberNames(node),
+        ]),
+        analyzer_ast.MethodDeclaration(:final parameters, :final typeParameters) => declares([
+          ...parameterNames(parameters),
+          ...typeParameterNames(typeParameters),
+        ]),
+        analyzer_ast.FunctionExpression(:final parameters, :final typeParameters) => declares([
+          ...parameterNames(parameters),
+          ...typeParameterNames(typeParameters),
+        ]),
+        analyzer_ast.ConstructorDeclaration(:final parameters) => declares(parameterNames(parameters)),
+        analyzer_ast.Block(:final statements) => declares([
+          for (final statement in statements)
+            ...switch (statement) {
+              analyzer_ast.VariableDeclarationStatement(:final variables) => [
+                for (final variable in variables.variables) variable.name,
+              ],
+              analyzer_ast.FunctionDeclarationStatement(:final functionDeclaration) => [functionDeclaration.name],
+              analyzer_ast.PatternVariableDeclarationStatement() => patternVariables(statement),
+              _ => const <analyzer_token.Token>[],
+            },
+        ]),
+        analyzer_ast.ForStatement(:final forLoopParts) || analyzer_ast.ForElement(:final forLoopParts) => declares([
+          ...switch (forLoopParts) {
+            analyzer_ast.ForPartsWithDeclarations(:final variables) => [
+              for (final variable in variables.variables) variable.name,
+            ],
+            analyzer_ast.ForEachPartsWithDeclaration(:final loopVariable) => [loopVariable.name],
+            _ => patternVariables(forLoopParts),
+          },
+        ]),
+        analyzer_ast.CatchClause(:final exceptionParameter, :final stackTraceParameter) => declares([
+          exceptionParameter?.name,
+          stackTraceParameter?.name,
+        ]),
+        analyzer_ast.SwitchPatternCase() ||
+        analyzer_ast.SwitchExpressionCase() ||
+        analyzer_ast.IfStatement() ||
+        analyzer_ast.IfElement() => declares(patternVariables(node)),
+        _ => false,
+      };
+      if (isShadowing) return true;
+    }
+    return false;
   }
 
   @override
@@ -1179,14 +1275,20 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
     if (element is analyzer_element.PrefixElement) {
       final parent = node.parent;
       if (parent is analyzer_ast.PrefixedIdentifier && parent.prefix == node) {
-        if (!_removePrefix(node.token, parent.period, parent.identifier.element ?? ObjectCollector.assignedElement(parent.identifier))) {
+        if (!_removePrefix(
+          node.token,
+          parent.period,
+          parent.identifier.element ?? ObjectCollector.assignedElement(parent.identifier),
+          parent,
+          parent.identifier.name,
+        )) {
           _recordPrefixUsage(node.token);
         }
       } else if (parent is analyzer_ast.MethodInvocation && parent.target == node) {
         if (parent.methodName.name == 'loadLibrary' && element.imports.every((import) => merger._isMergedLibrary(import.importedLibrary))) {
           // Deferred loading of a merged library, which is always loaded.
           source.addEdit(parent.offset, parent.end, 'Future<void>.value()');
-        } else if (!_removePrefix(node.token, parent.operator!, parent.methodName.element)) {
+        } else if (!_removePrefix(node.token, parent.operator!, parent.methodName.element, parent, parent.methodName.name)) {
           _recordPrefixUsage(node.token);
         }
       } else {
@@ -1218,7 +1320,7 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
     final importPrefix = node.importPrefix;
     var isPrefixed = importPrefix != null;
     if (importPrefix != null) {
-      if (_removePrefix(importPrefix.name, importPrefix.period, node.element)) {
+      if (_removePrefix(importPrefix.name, importPrefix.period, node.element, node, node.name.lexeme)) {
         isPrefixed = false;
       } else {
         _recordPrefixUsage(importPrefix.name);
@@ -1496,5 +1598,17 @@ class _ImplicitThisVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
     } else {
       source.addEdit(node.offset, node.offset, 'this.', priority: 0);
     }
+  }
+}
+
+/// Collects the names of the variables declared by patterns.
+///
+class _PatternVariableCollector extends analyzer_visitor.RecursiveAstVisitor<void> {
+  final names = <analyzer_token.Token>[];
+
+  @override
+  void visitDeclaredVariablePattern(analyzer_ast.DeclaredVariablePattern node) {
+    names.add(node.name);
+    super.visitDeclaredVariablePattern(node);
   }
 }

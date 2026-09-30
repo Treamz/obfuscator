@@ -139,7 +139,7 @@ void main() {
     });
 
     test('keeps fields overriding or overridden by explicit accessors and third-party members', () {
-      for (final name in ['area', 'value', 'stackTrace', 'hashCode', 'name']) {
+      for (final name in ['area', 'value', 'stackTrace', 'hashCode', 'name', '_low']) {
         expect(copied, _containsWord(name), reason: name);
       }
     });

@@ -7,6 +7,7 @@ import 'package:analyzer/dart/ast/ast.dart' as analyzer_ast;
 import 'package:analyzer/dart/ast/token.dart' as analyzer_token;
 import 'package:analyzer/dart/ast/visitor.dart' as analyzer_visitor;
 import 'package:analyzer/dart/element/element.dart' as analyzer_element;
+import 'package:analyzer/dart/element/type.dart' as analyzer_type;
 import 'package:analyzer/diagnostic/diagnostic.dart' as analyzer_diagnostic;
 import 'package:obfuscator/src/config.dart';
 import 'package:path/path.dart' as path;
@@ -380,6 +381,7 @@ class ObjectCollector {
           declarations: declarations,
         ),
       );
+      source.resolvedUnitResult.unit.accept(_DynamicAccessVisitor(declarations.dynamicMemberNames));
     }
     return declarations;
   }
@@ -398,6 +400,68 @@ class ObjectCollector {
     }
   }
 
+  /// Resolves a URI of a directive in the [source] to a file path, for the relative and first-party URIs.
+  ///
+  String? _resolveDirectiveUri(ObjectCollectorSource source, String? uri) {
+    if (uri == null || uri.startsWith('dart:')) return null;
+    if (uri.startsWith('package:')) {
+      final segments = Uri.parse(uri).pathSegments;
+      for (final package in _configuration.packages) {
+        if (segments.isNotEmpty && package.name == segments.first) {
+          return path.joinAll([package.copyDirectory.path, 'lib', ...segments.skip(1)]);
+        }
+      }
+      return null;
+    }
+    return path.normalize(path.join(path.dirname(source.file.path), uri));
+  }
+
+  /// Groups of class-like elements with the same names, provided by the alternatives of conditional directives.
+  ///
+  List<List<analyzer_element.InterfaceElement>> _conditionalAlternatives() {
+    final librariesByPath = {
+      for (final source in objectCollectorSources)
+        if (!source.resolvedUnitResult.unit.directives.any((directive) => directive is analyzer_ast.PartOfDirective))
+          source.file.path: source.resolvedUnitResult.libraryElement,
+    };
+    final groups = <List<analyzer_element.InterfaceElement>>[];
+    for (final source in objectCollectorSources) {
+      for (final directive in source.resolvedUnitResult.unit.directives.whereType<analyzer_ast.NamespaceDirective>()) {
+        if (directive.configurations.isEmpty) continue;
+        final libraries = <Uri, analyzer_element.LibraryElement>{};
+        void add(analyzer_element.LibraryElement? library) {
+          if (library != null) libraries[library.uri] = library;
+        }
+
+        add(switch (directive) {
+          analyzer_ast.ImportDirective(:final libraryImport) => libraryImport?.importedLibrary,
+          analyzer_ast.ExportDirective(:final libraryExport) => libraryExport?.exportedLibrary,
+        });
+        add(librariesByPath[_resolveDirectiveUri(source, directive.uri.stringValue)]);
+        for (final configuration in directive.configurations) {
+          final resolvedUri = configuration.resolvedUri;
+          add(
+            resolvedUri is analyzer_element.DirectiveUriWithLibrary
+                ? resolvedUri.library
+                : librariesByPath[_resolveDirectiveUri(source, configuration.uri.stringValue)],
+          );
+        }
+        if (libraries.length < 2) continue;
+        final elementsByName = <String, List<analyzer_element.InterfaceElement>>{};
+        for (final library in libraries.values) {
+          for (final entry in library.exportNamespace.definedNames2.entries) {
+            final element = entry.value;
+            if (element is analyzer_element.InterfaceElement) {
+              elementsByName.putIfAbsent(entry.key, () => []).add(element);
+            }
+          }
+        }
+        groups.addAll(elementsByName.values.where((elements) => elements.length > 1));
+      }
+    }
+    return groups;
+  }
+
   /// Groups the fields into families of overriding members, and selects the symbols to be obfuscated.
   ///
   void _selectSymbols(_Declarations declarations) {
@@ -409,6 +473,10 @@ class ObjectCollector {
       if (!declarations.fields.containsKey(key)) nonRenamableMembers.add(key);
     }
 
+    // Fields accessed dynamically can't be renamed, as the accesses can't be matched to their declarations.
+    for (final entry in declarations.fields.entries) {
+      if (declarations.dynamicMemberNames.contains(entry.value.name)) nonRenamableMembers.add(entry.key);
+    }
     for (final element in declarations.interfaces) {
       for (final member in _declaredMembers(element)) {
         addMember(element, member.name);
@@ -442,16 +510,39 @@ class ObjectCollector {
         }
       }
     }
+    // Classes with the same name, declared by the alternatives of conditional imports or exports
+    // (e.g., `if (dart.library.io)`), must keep matching names, along with their members.
+    final classFamilies = _UnionFind();
+    final nonRenamableClasses = <String>{};
+    for (final group in _conditionalAlternatives()) {
+      final first = group.first;
+      for (final element in group) {
+        classFamilies.union(classKey(first), classKey(element));
+        if (!declarations.classes.containsKey(classKey(element))) nonRenamableClasses.add(classKey(element));
+        for (final member in _declaredMembers(element)) {
+          addMember(first, member.name);
+          addMember(element, member.name);
+          families.union(memberKey(first, member.name), memberKey(element, member.name));
+        }
+      }
+    }
     final nonRenamableFamilies = {for (final key in nonRenamableMembers) families.find(key)};
+    final nonRenamableClassFamilies = {for (final key in nonRenamableClasses) classFamilies.find(key)};
 
+    final classSymbols = <String, ObfuscatedSymbol>{};
     for (final entry in declarations.classes.entries) {
-      final symbol = ObfuscatedSymbol(
-        key: entry.key,
-        name: entry.value,
-        kind: ObfuscatedSymbolKind.classDeclaration,
-        parentName: null,
-      );
-      symbols.add(symbol);
+      final family = classFamilies.find(entry.key);
+      if (nonRenamableClassFamilies.contains(family)) continue;
+      final symbol = classSymbols.putIfAbsent(family, () {
+        final symbol = ObfuscatedSymbol(
+          key: family,
+          name: entry.value,
+          kind: ObfuscatedSymbolKind.classDeclaration,
+          parentName: null,
+        );
+        symbols.add(symbol);
+        return symbol;
+      });
       _symbolsByKey[entry.key] = symbol;
     }
     final familySymbols = <String, ObfuscatedSymbol>{};
@@ -519,6 +610,10 @@ class _Declarations {
   /// Fields which can be obfuscated, mapped by their member keys.
   ///
   final fields = <String, ({String name, String parentName})>{};
+
+  /// Names of the members accessed dynamically (e.g., on a `dynamic` receiver), which can't be resolved.
+  ///
+  final dynamicMemberNames = <String>{};
 }
 
 /// Disjoint-set structure used for grouping overriding members.
@@ -630,6 +725,39 @@ class _DeclarationVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
       if (enclosingElement is! analyzer_element.InterfaceElement) continue;
       declarations.fields[ObjectCollector.memberKey(enclosingElement, name)] = (name: name, parentName: parentName);
     }
+  }
+}
+
+/// Collects the names of the members accessed on receivers with the `dynamic` or an unresolved type.
+///
+class _DynamicAccessVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
+  _DynamicAccessVisitor(this.names);
+
+  final Set<String> names;
+
+  void _record(analyzer_ast.SimpleIdentifier name, analyzer_ast.Expression? target) {
+    if (target == null) return;
+    if ((name.element ?? ObjectCollector.assignedElement(name)) != null) return;
+    final type = target.staticType;
+    if (type == null || type is analyzer_type.DynamicType || type is analyzer_type.InvalidType) names.add(name.name);
+  }
+
+  @override
+  void visitPropertyAccess(analyzer_ast.PropertyAccess node) {
+    _record(node.propertyName, node.realTarget);
+    super.visitPropertyAccess(node);
+  }
+
+  @override
+  void visitPrefixedIdentifier(analyzer_ast.PrefixedIdentifier node) {
+    if (node.prefix.element is! analyzer_element.PrefixElement) _record(node.identifier, node.prefix);
+    super.visitPrefixedIdentifier(node);
+  }
+
+  @override
+  void visitMethodInvocation(analyzer_ast.MethodInvocation node) {
+    _record(node.methodName, node.realTarget);
+    super.visitMethodInvocation(node);
   }
 }
 
