@@ -202,6 +202,8 @@ https://github.com/ljmatan/obfuscator/tree/main/output
   the name of the source package if a single one is provided, and is named `merged_app` otherwise.
 - `<out>/assets/...` — assets and fonts declared by the source packages.
 - `<out>/lib/...` — non-Dart files of the `lib` directories (e.g., resources resolved with `package:` URIs).
+  When multiple packages are merged, `package:` URIs with their original names must be updated (reported with
+  a warning).
 - `<out>/mappings.json` — JSON map of original → obfuscated symbol names.
 
 ---

@@ -3,6 +3,16 @@ import '.gen/defaults.dart';
 import 'box.dart';
 import 'box_impl.dart';
 import 'coded_impl.dart';
+import 'null_aware/badge.dart';
+import 'null_aware/profile.dart';
+import 'shared/first.dart';
+import 'shared/local.dart';
+import 'shared/other.dart';
+import 'speed_first.dart';
+import 'speed_second.dart';
+import 'stubs/config.dart';
+import 'stubs/fake_repository.dart';
+import 'stubs/fixed_config.dart';
 import 'dev_ext.dart';
 import 'dev_ext_prefixed.dart';
 import 'fake_service.dart';
@@ -64,6 +74,13 @@ Future<void> main() async {
     'generics ${firstOf<int>([1, 2])} ${LegacyBox<String>('boxed').value} ${biggestOf([3, 9, 4])}',
     await resourceReport(),
     'holder ${Holder(4).doubled} ${FixedHolder().doubled}',
+    'null aware ${displayName(Profile(Member('ann lee')))} ${displayName(Profile(null))} ${displayName(null)}',
+    'null aware ${initialsLength(Member('ann lee'))} ${initialsLength(null)} ${nicknameOrDash(Member('a'))} ${nicknameOrDash(null)}',
+    badge('ok'),
+    'repository ${FakeRepository().load('a')} ${FakeRepository().loadLogged('b')} $repositoryLogs',
+    'configs ${const <Config>[Config('x'), Config(), fixedConfig].map((config) => config.value).join(' ')}',
+    'speed ${Stopwatch2().run()} ${Runner().run()}',
+    'shared ${sharedLocal('a')} ${sharedOther('b')} ${sharedFirst('c')}',
     'walker ${Walker().walk([1, 2, 3])} ${current()}',
   ]) {
     print(line);

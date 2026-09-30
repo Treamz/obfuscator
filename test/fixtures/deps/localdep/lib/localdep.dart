@@ -7,3 +7,7 @@ class Gadget {
 }
 
 int localCount = 3;
+
+extension SharedX on String {
+  String sharedShout() => 'local:$this';
+}

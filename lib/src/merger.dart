@@ -430,6 +430,27 @@ class ProjectMerger {
           if (declaration.declaredFragment?.element case final element?) _extensionKey(element): (source, declaration),
     };
     final overrideNames = <String, String?>{};
+    final extensionPrefixes = <String, String>{};
+    String uniqueName(String base) {
+      var index = 0;
+      while (usedNames.contains('$base$index')) {
+        index++;
+      }
+      usedNames.add('$base$index');
+      return '$base$index';
+    }
+
+    // Extension method invoking a closure with its receiver, used for the null-shorting chains.
+    String? let;
+    String letName() {
+      if (let != null) return let!;
+      final extension = uniqueName('_MergedLet');
+      final method = uniqueName('_mergedLet');
+      _additionalDeclarations.add(
+        'extension $extension<T extends Object> on T {\n  R $method<R>(R Function(T value) apply) => apply(this);\n}',
+      );
+      return let = method;
+    }
 
     String? overrideName(_MergedSource source, analyzer_element.ExtensionElement extension) {
       final key = _extensionKey(extension);
@@ -447,7 +468,25 @@ class ProjectMerger {
           // The namespaces of prefixed imports contain the prefixed names.
           final imported = import.namespace.get2(prefix == null ? name : '$prefix.$name');
           if (imported is! analyzer_element.ExtensionElement || _extensionKey(imported) != key) continue;
-          if (prefix == null) return name;
+          if (prefix == null) {
+            // A dedicated import prefix avoids clashes with other declarations of the same name.
+            final uri = import.importedLibrary?.uri.toString();
+            if (uri == null) return null;
+            final dedicatedPrefix = extensionPrefixes.putIfAbsent(uri, () {
+              final prefix = uniqueName('_merged_extensions');
+              imports.add(
+                _MergedImport(
+                  source: null,
+                  libraryKey: uri,
+                  prefix: prefix,
+                  isDeferred: false,
+                  render: (prefix) => "import '$uri' as $prefix",
+                ),
+              );
+              return prefix;
+            });
+            return '$dedicatedPrefix.$name';
+          }
           final mergedPrefix = imports
               .where(
                 (merged) => merged.source?.result.libraryElement.uri == source.result.libraryElement.uri && merged.originalPrefix == prefix,
@@ -482,14 +521,15 @@ class ProjectMerger {
           if (!visible.containsKey(entry.key)) ..._extensionMemberNames(entry.value),
       };
       if (memberNames.isEmpty) continue;
-      source.result.unit.accept(
-        _ExtensionOverrideVisitor(
-          source: source,
-          memberNames: memberNames,
-          overrideName: (extension) => overrideName(source, extension),
-          explicitOffsets: _explicitExtensionOffsets,
-        ),
+      final visitor = _ExtensionOverrideVisitor(
+        newValueName: () => uniqueName('_mergedValue'),
+        source: source,
+        memberNames: memberNames,
+        overrideName: (extension) => overrideName(source, extension),
+        explicitOffsets: _explicitExtensionOffsets,
       );
+      source.result.unit.accept(visitor);
+      if (visitor.nullAwareRewrites.isNotEmpty) visitor.applyNullAwareRewrites(letName());
     }
   }
 
@@ -501,6 +541,8 @@ class ProjectMerger {
     if (base is analyzer_element.FieldFormalParameterElement) base = base.field;
     if (base is analyzer_element.PropertyAccessorElement) base = base.variable;
     if (base is! analyzer_element.FieldElement && base is! analyzer_element.MethodElement) return null;
+    // Enum constants are static, they can't clash with the members of other libraries.
+    if (base is analyzer_element.FieldElement && base.isEnumConstant) return null;
     final name = base!.name;
     if (name == null || !name.startsWith('_') || base.enclosingElement is! analyzer_element.InstanceElement) return null;
     return '${base.library!.uri}#$name';
@@ -685,6 +727,16 @@ class ProjectMerger {
   /// - mixin applications (which can't declare members) get the stubs from a dedicated mixin.
   ///
   void _implementPrivateMembers(List<_MergedSource> sources, Set<String> usedNames) {
+    // Top-level declarations, which the stubs of the same names would shadow within the class bodies.
+    final topLevelKeysByName = <String, List<String>>{};
+    for (final source in sources) {
+      for (final declaration in source.result.unit.declarations) {
+        for (final (element, _) in _declaredTopLevelElements(declaration)) {
+          topLevelKeysByName.putIfAbsent(element.name!, () => []).add(_topLevelKey(element));
+        }
+      }
+    }
+
     String uniqueName(String base) {
       var index = 0;
       var name = base;
@@ -725,11 +777,19 @@ class ProjectMerger {
         final missing = required.difference(concrete);
         if (missing.isEmpty) continue;
 
-        final isAlias = declaration is analyzer_ast.ClassTypeAlias;
+        // Mixin applications with constant superclass constructors are converted to classes, as the stubs
+        // can't be provided by a mixin without making their constructors non-constant.
+        final superConstructors = [
+          for (final constructor in element.supertype?.element.constructors ?? const <analyzer_element.ConstructorElement>[])
+            if (!constructor.isFactory && !(constructor.name?.startsWith('_') == true && constructor.library.uri != element.library.uri))
+              constructor,
+        ];
+        final isConvertedAlias = declaration is analyzer_ast.ClassTypeAlias && superConstructors.any((constructor) => constructor.isConst);
+        final isAlias = declaration is analyzer_ast.ClassTypeAlias && !isConvertedAlias;
         final override = isAlias ? '' : '@override\n  ';
         // Late fields can't be declared by enums, and by classes with constant constructors (for mixin
         // applications, by the superclass).
-        final constructors = isAlias ? element.supertype?.element.constructors ?? const [] : element.constructors;
+        final constructors = declaration is analyzer_ast.ClassTypeAlias ? superConstructors : element.constructors;
         final canBeLate =
             declaration is! analyzer_ast.EnumDeclaration &&
             !constructors.any((constructor) => constructor.isConst && !constructor.isFactory);
@@ -763,6 +823,7 @@ class ProjectMerger {
         var needsNoSuchMethod = false;
         for (final key in missing) {
           final name = key.substring(key.indexOf(':') + 1);
+          _capturedTopLevelKeys.addAll(topLevelKeysByName[name] ?? const []);
           switch (key.substring(0, key.indexOf(':'))) {
             case 'get':
               final error = 'throw NoSuchMethodError.withInvocation(this, Invocation.getter(#$name))';
@@ -821,6 +882,38 @@ class ProjectMerger {
             source.addEdit(rightBracket.offset, rightBracket.offset, stubs.toString());
           case analyzer_ast.EnumDeclaration():
             _addEnumMembers(source, declaration, stubs.toString());
+          case analyzer_ast.ClassTypeAlias(:final equals, :final semicolon, :final name) when isConvertedAlias:
+            // `class A = S with M;` is declared as `class A extends S with M { ... }`, forwarding the superclass
+            // constructors with super parameters.
+            final mixinsHaveFields = element.mixins.any(
+              (mixin) => mixin.element.fields.any((field) => !field.isStatic && !field.isSynthetic),
+            );
+            final forwarders = StringBuffer();
+            for (final constructor in superConstructors) {
+              final parameters = constructor.formalParameters;
+              final isUnnamed = constructor.name == null || constructor.name == 'new' || constructor.name!.isEmpty;
+              final parameterList = [
+                for (final (index, parameter) in parameters.indexed)
+                  if (parameter.isRequiredPositional) 'super.p$index',
+                if (parameters.any((parameter) => parameter.isOptionalPositional))
+                  '[${[
+                    for (final (index, parameter) in parameters.indexed)
+                      if (parameter.isOptionalPositional) 'super.p$index',
+                  ].join(', ')}]',
+                if (parameters.any((parameter) => parameter.isNamed))
+                  '{${[
+                    for (final parameter in parameters)
+                      if (parameter.isNamed) '${parameter.isRequiredNamed ? 'required ' : ''}super.${parameter.name}',
+                  ].join(', ')}}',
+              ].join(', ');
+              forwarders.write(
+                '\n  ${constructor.isConst && !mixinsHaveFields ? 'const ' : ''}'
+                '${isUnnamed ? name.lexeme : '${name.lexeme}.${constructor.name}'}($parameterList)'
+                '${isUnnamed ? '' : ' : super.${constructor.name}()'};\n',
+              );
+            }
+            source.addEdit(equals.offset, equals.end, 'extends');
+            source.addEdit(semicolon.offset, semicolon.end, ' {$forwarders$stubs}');
           case analyzer_ast.ClassTypeAlias(:final withClause):
             final mixinName = uniqueName('_MergedStubs');
             _additionalDeclarations.add('mixin $mixinName {$stubs}');
@@ -1263,6 +1356,7 @@ class ProjectMerger {
   ///
   void _copyLibraryResources() {
     final outputLib = path.join(_configuration.outputDirectory.path, 'lib');
+    final reportedPackages = <String>{};
     for (final package in _configuration.packages) {
       final libDirectory = dart_io.Directory(path.join(package.copyDirectory.path, 'lib'));
       if (!libDirectory.existsSync()) continue;
@@ -1276,6 +1370,12 @@ class ProjectMerger {
         }
         target.parent.createSync(recursive: true);
         entity.copySync(target.path);
+        if (_configuration.packages.length > 1 && reportedPackages.add(package.name)) {
+          print(
+            'Warning: the resources of the ${package.name} package are included with the merged package, '
+            'references to them with `package:${package.name}/` URIs must be updated.',
+          );
+        }
       }
     }
   }
@@ -1849,6 +1949,7 @@ class _PrivateMemberVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
 ///
 class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
   _ExtensionOverrideVisitor({
+    required this.newValueName,
     required this.source,
     required this.memberNames,
     required this.overrideName,
@@ -1858,6 +1959,81 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
   /// Positions of the invocations on the implicit `this` made explicit, which don't need other qualification.
   ///
   final Set<(_MergedSource, int)> explicitOffsets;
+
+  /// Returns a unique name for the closure parameters of the null-shorting rewrites.
+  ///
+  final String Function() newValueName;
+
+  /// Rewrites of the null-aware operators of null-shorting chains, with the extensions applied after them
+  /// (outermost first) and the end of the outermost invocation.
+  ///
+  final nullAwareRewrites = <analyzer_token.Token, ({List<String> names, int end, String value})>{};
+
+  /// Returns the null-aware operator short-circuiting the [target] of an invocation, if any.
+  ///
+  static analyzer_token.Token? _nullShortingOperator(analyzer_ast.Expression target) {
+    analyzer_ast.Expression? current = target;
+    while (current != null) {
+      switch (current) {
+        case analyzer_ast.PropertyAccess(:final operator, :final target):
+          if (operator.type == analyzer_token.TokenType.QUESTION_PERIOD) return operator;
+          current = target;
+        case analyzer_ast.MethodInvocation(:final operator, :final target):
+          if (operator?.type == analyzer_token.TokenType.QUESTION_PERIOD) return operator;
+          current = target;
+        case analyzer_ast.IndexExpression(:final question, :final target):
+          if (question != null) return question;
+          current = target;
+        case analyzer_ast.PostfixExpression(:final operand, :final operator) when operator.type == analyzer_token.TokenType.BANG:
+          current = operand;
+        default:
+          return null;
+      }
+    }
+    return null;
+  }
+
+  /// The null-shorting chain continuing after the [node] (e.g., with `.length` in `a?.b.ext().length`).
+  ///
+  static analyzer_ast.AstNode _nullShortingChain(analyzer_ast.AstNode node) {
+    var current = node;
+    while (true) {
+      final parent = current.parent;
+      final continuesChain = switch (parent) {
+        analyzer_ast.PropertyAccess(:final target) ||
+        analyzer_ast.MethodInvocation(:final target) ||
+        analyzer_ast.IndexExpression(:final target) => target == current,
+        analyzer_ast.PostfixExpression(:final operand, :final operator) =>
+          operand == current && operator.type == analyzer_token.TokenType.BANG,
+        analyzer_ast.AssignmentExpression(:final leftHandSide) => leftHandSide == current,
+        _ => false,
+      };
+      if (!continuesChain) return current;
+      current = parent!;
+    }
+  }
+
+  /// Whether the [node] contains an `await` expression, which can't be moved into a closure.
+  ///
+  static bool _containsAwait(analyzer_ast.AstNode node) {
+    final collector = _AwaitCollector();
+    node.accept(collector);
+    return collector.found;
+  }
+
+  /// Applies the recorded rewrites of null-aware operators, using the [let] extension method.
+  ///
+  void applyNullAwareRewrites(String let) {
+    for (final entry in nullAwareRewrites.entries) {
+      final operator = entry.key;
+      final rewrite = entry.value;
+      final isIndex = operator.type == analyzer_token.TokenType.QUESTION;
+      final access = isIndex ? '${rewrite.value}[' : '${rewrite.value}.';
+      final end = isIndex ? operator.next!.end : operator.end;
+      source.addEdit(operator.offset, end, '?.$let((${rewrite.value}) => ${rewrite.names.map((name) => '$name(').join()}$access');
+      source.addEdit(rewrite.end, rewrite.end, ')');
+    }
+  }
 
   final _MergedSource source;
 
@@ -1924,7 +2100,24 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
       }
       return;
     }
-    source.addEdit(target!.offset, target.offset, '$extensionName(', priority: 0);
+    // Within a null-shorting chain (e.g., `user?.name.initials`), the override is applied to the value after the
+    // null-aware operator, in a closure invoked with the same operator: `user?.let((v) => StringX(v.name).initials)`.
+    final nullAwareOperator = _nullShortingOperator(target!);
+    if (nullAwareOperator != null) {
+      final chain = _nullShortingChain(node);
+      if (element is analyzer_element.SetterElement || _containsAwait(chain)) {
+        _warn(node, name);
+        return;
+      }
+      final rewrite = nullAwareRewrites.putIfAbsent(
+        nullAwareOperator,
+        () => (names: <String>[], end: chain.end, value: newValueName()),
+      );
+      rewrite.names.add(extensionName);
+      source.addEdit(target.end, target.end, ')');
+      return;
+    }
+    source.addEdit(target.offset, target.offset, '$extensionName(', priority: 0);
     source.addEdit(target.end, target.end, ')');
   }
 
@@ -2245,4 +2438,16 @@ class _WildcardVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
     final newName = _renames[node.element ?? ObjectCollector.assignedElement(node)];
     if (newName != null) source.addEdit(node.offset, node.end, newName);
   }
+}
+
+/// Finds `await` expressions, excluding the ones of nested functions.
+///
+class _AwaitCollector extends analyzer_visitor.RecursiveAstVisitor<void> {
+  bool found = false;
+
+  @override
+  void visitAwaitExpression(analyzer_ast.AwaitExpression node) => found = true;
+
+  @override
+  void visitFunctionExpression(analyzer_ast.FunctionExpression node) {}
 }
