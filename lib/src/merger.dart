@@ -91,6 +91,7 @@ class _TopLevelReference {
     required this.offset,
     required this.end,
     required this.element,
+    required this.isSimpleInterpolation,
   });
 
   final _MergedSource source;
@@ -100,6 +101,10 @@ class _TopLevelReference {
   final int end;
 
   final analyzer_element.Element element;
+
+  /// Whether the reference is a simple string interpolation (e.g., `$name`), which can't be prefixed as it is.
+  ///
+  final bool isSimpleInterpolation;
 }
 
 /// Class used for merging all of the available source code directories into a single file.
@@ -368,6 +373,10 @@ class ProjectMerger {
   ///
   final _capturedTopLevelKeys = <String>{};
 
+  /// Positions of the extension member invocations on the implicit `this`, which were made explicit.
+  ///
+  final _explicitExtensionOffsets = <(_MergedSource, int)>{};
+
   /// New names of the top-level declarations renamed to avoid clashes, mapped by their keys.
   ///
   final _topLevelRenames = <String, String>{};
@@ -451,6 +460,7 @@ class ProjectMerger {
           source: source,
           memberNames: memberNames,
           overrideName: (extension) => overrideName(source, extension),
+          explicitOffsets: _explicitExtensionOffsets,
         ),
       );
     }
@@ -501,21 +511,6 @@ class ProjectMerger {
     return _privateRenames['${element.library.uri}#$name'] ?? name;
   }
 
-  /// Names of the instance members of the [element] in the merged file, only the concrete ones if [concrete].
-  ///
-  Iterable<String> _instanceMemberNames(analyzer_element.InterfaceElement element, {required bool concrete}) sync* {
-    for (final field in element.fields) {
-      if (!field.isStatic && !field.isSynthetic && !(concrete && field.isAbstract) && field.name != null) {
-        yield _mergedMemberName(element, field.name!);
-      }
-    }
-    for (final member in <analyzer_element.ExecutableElement>[...element.getters, ...element.setters, ...element.methods]) {
-      if (!member.isStatic && !member.isSynthetic && !(concrete && member.isAbstract) && member.name != null) {
-        yield _mergedMemberName(element, member.name!);
-      }
-    }
-  }
-
   /// Names declared at the top level of the merged file, or provided by its imports (including prefixes).
   ///
   Set<String> _mergedScopeNames(List<_MergedSource> sources, List<_MergedImport> imports) {
@@ -543,40 +538,163 @@ class ProjectMerger {
     }
   }
 
-  /// Adds `noSuchMethod` forwarders to the classes implementing private members of other merged libraries.
+  /// Instance members of the [element] in the merged file, as `get:name`, `set:name` or `method:name` keys,
+  /// only the concrete ones if [concrete].
+  ///
+  Iterable<String> _instanceMemberKeys(analyzer_element.InterfaceElement element, {required bool concrete}) sync* {
+    bool include(bool isStatic, bool isSynthetic, bool isAbstract) => !isStatic && !isSynthetic && !(concrete && isAbstract);
+    for (final field in element.fields) {
+      if (!include(field.isStatic, field.isSynthetic, field.isAbstract) || field.name == null) continue;
+      final name = _mergedMemberName(element, field.name!);
+      yield 'get:$name';
+      if (field.setter != null) yield 'set:$name';
+    }
+    for (final getter in element.getters) {
+      if (include(getter.isStatic, getter.isSynthetic, getter.isAbstract) && getter.name != null) {
+        yield 'get:${_mergedMemberName(element, getter.name!)}';
+      }
+    }
+    for (final setter in element.setters) {
+      if (include(setter.isStatic, setter.isSynthetic, setter.isAbstract) && setter.name != null) {
+        yield 'set:${_mergedMemberName(element, setter.name!)}';
+      }
+    }
+    for (final method in element.methods) {
+      if (include(method.isStatic, false, method.isAbstract) && method.name != null) {
+        yield 'method:${_mergedMemberName(element, method.name!)}';
+      }
+    }
+  }
+
+  /// Adapts the libraries opted into older language versions (e.g., `// @dart=2.19`) to the merged file.
+  ///
+  /// The merged file is a single library with a single language version, so the version comments are removed.
+  /// The classes of libraries older than Dart 3.0 which are used as mixins are declared as `mixin class`,
+  /// as required by Dart 3.0.
+  ///
+  void _adaptLanguageVersions(List<_MergedSource> sources) {
+    final mixinKeys = <String>{
+      for (final source in sources)
+        for (final declaration in source.result.unit.declarations)
+          for (final type in switch (declaration) {
+            analyzer_ast.ClassDeclaration(:final withClause) ||
+            analyzer_ast.EnumDeclaration(:final withClause) => withClause?.mixinTypes ?? const <analyzer_ast.NamedType>[],
+            analyzer_ast.ClassTypeAlias(:final withClause) => withClause.mixinTypes,
+            _ => const <analyzer_ast.NamedType>[],
+          })
+            if (_topLevelElement(type.element) case final element?) _topLevelKey(element),
+    };
+    for (final source in sources) {
+      final versionToken = source.result.unit.languageVersionToken;
+      if (versionToken != null) source.addEdit(versionToken.offset, versionToken.end, '');
+      final version = source.result.libraryElement.languageVersion.effective;
+      if (version.major >= 3) continue;
+      if (version < pub_semver.Version(2, 12, 0)) {
+        print('Warning: ${source.filePath} uses the language version $version without null safety, which can\'t be merged.');
+      }
+      for (final declaration in source.result.unit.declarations.whereType<analyzer_ast.ClassDeclaration>()) {
+        final element = _topLevelElement(declaration.declaredFragment?.element);
+        if (element != null && declaration.mixinKeyword == null && mixinKeys.contains(_topLevelKey(element))) {
+          source.addEdit(declaration.classKeyword.offset, declaration.classKeyword.offset, 'mixin ');
+        }
+      }
+    }
+  }
+
+  /// Declarations added to the merged file, e.g., the mixin providing the `noSuchMethod` forwarders.
+  ///
+  final _additionalDeclarations = <String>[];
+
+  /// Implements the private members of other merged libraries, which classes, enums and mixin applications
+  /// didn't have to implement before merging.
   ///
   /// A class doesn't have to implement the private members of an interface declared by another library,
   /// as they can't be accessed, and invoking them throws a [NoSuchMethodError]. Once the libraries are merged,
-  /// such members must be implemented. Overriding `noSuchMethod` generates forwarders for them, which keep
-  /// throwing the [NoSuchMethodError].
+  /// such members must be implemented, still throwing the [NoSuchMethodError]:
+  /// - missing getters of classes are implemented with `late final Never` fields, which keep the private fields
+  ///   of the library promotable (unlike explicit getters or `noSuchMethod` forwarders),
+  /// - the other missing members are implemented with `noSuchMethod` forwarders, generated by overriding
+  ///   `noSuchMethod`, or by a dedicated mixin for enums and mixin applications (which can't declare members).
   ///
-  void _addPrivateMemberForwarders(List<_MergedSource> sources) {
+  void _implementPrivateMembers(List<_MergedSource> sources, Set<String> usedNames) {
+    String? mixinName;
+    String forwarderMixin() {
+      final existing = mixinName;
+      if (existing != null) return existing;
+      var index = 0;
+      var name = '_MergedNoSuchMethod';
+      while (usedNames.contains(name)) {
+        name = '_MergedNoSuchMethod${++index}';
+      }
+      usedNames.add(name);
+      _additionalDeclarations.add(
+        'mixin $name {\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n}',
+      );
+      return mixinName = name;
+    }
+
     for (final source in sources) {
-      for (final declaration in source.result.unit.declarations.whereType<analyzer_ast.ClassDeclaration>()) {
-        final element = declaration.declaredFragment?.element;
-        if (element == null || element.isAbstract) continue;
+      for (final declaration in source.result.unit.declarations) {
+        final element = switch (declaration) {
+          analyzer_ast.ClassDeclaration(:final declaredFragment) => declaredFragment?.element,
+          analyzer_ast.EnumDeclaration(:final declaredFragment) => declaredFragment?.element,
+          analyzer_ast.ClassTypeAlias(:final declaredFragment) => declaredFragment?.element,
+          _ => null,
+        };
+        if (element == null || element is analyzer_element.ClassElement && element.isAbstract) continue;
         final required = <String>{
           for (final supertype in element.allSupertypes)
             if (_isMergedLibrary(supertype.element.library) && supertype.element.library.uri != element.library.uri)
-              for (final name in _instanceMemberNames(supertype.element, concrete: false))
-                if (name.startsWith('_')) name,
+              for (final key in _instanceMemberKeys(supertype.element, concrete: false))
+                if (key.substring(key.indexOf(':') + 1).startsWith('_')) key,
         };
         if (required.isEmpty) continue;
         // Concrete members of the superclass chain (excluding `Object`) and of the applied mixins.
         final concrete = <String>{};
         for (var type = element.thisType; !type.isDartCoreObject; type = type.element.supertype!) {
           for (final declarer in [type.element, for (final mixin in type.mixins) mixin.element]) {
-            concrete.addAll(_instanceMemberNames(declarer, concrete: true));
+            concrete.addAll(_instanceMemberKeys(declarer, concrete: true));
           }
           if (type.element.supertype == null) break;
         }
-        // A custom `noSuchMethod` already generates the forwarders.
-        if (concrete.contains('noSuchMethod') || required.every(concrete.contains)) continue;
-        source.addEdit(
-          declaration.rightBracket.offset,
-          declaration.rightBracket.offset,
-          '\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n',
-        );
+        final missing = required.difference(concrete);
+        if (missing.isEmpty) continue;
+        final hasNoSuchMethod = concrete.contains('method:noSuchMethod');
+
+        if (declaration is analyzer_ast.ClassDeclaration) {
+          final hasConstConstructor = element.constructors.any(
+            (constructor) => constructor.isConst && !constructor.isFactory,
+          );
+          final members = StringBuffer();
+          for (final key in missing.where((key) => key.startsWith('get:'))) {
+            final name = key.substring(4);
+            final error = 'throw NoSuchMethodError.withInvocation(this, Invocation.getter(#$name))';
+            // Late fields can't be declared by classes with constant constructors.
+            members.write(
+              hasConstConstructor ? '\n  @override\n  Never get $name => $error;\n' : '\n  @override\n  late final Never $name = $error;\n',
+            );
+          }
+          if (!hasNoSuchMethod && missing.any((key) => !key.startsWith('get:'))) {
+            members.write('\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n');
+          }
+          source.addEdit(declaration.rightBracket.offset, declaration.rightBracket.offset, members.toString());
+          continue;
+        }
+        if (hasNoSuchMethod) continue;
+        switch (declaration) {
+          case analyzer_ast.EnumDeclaration(:final withClause, :final implementsClause, :final name, :final typeParameters):
+            if (withClause != null) {
+              source.addEdit(withClause.end, withClause.end, ', ${forwarderMixin()}');
+            } else if (implementsClause != null) {
+              source.addEdit(implementsClause.offset, implementsClause.offset, 'with ${forwarderMixin()} ');
+            } else {
+              final end = typeParameters?.end ?? name.end;
+              source.addEdit(end, end, ' with ${forwarderMixin()}');
+            }
+          case analyzer_ast.ClassTypeAlias(:final withClause):
+            source.addEdit(withClause.end, withClause.end, ', ${forwarderMixin()}');
+          default:
+        }
       }
     }
   }
@@ -620,7 +738,15 @@ class ProjectMerger {
   ///
   /// A prefix may be shared by multiple files only if it refers to the same libraries in all of them.
   ///
-  void _resolvePrefixClashes(List<_MergedImport> imports, Set<String> usedNames) {
+  void _resolvePrefixClashes(List<_MergedSource> sources, List<_MergedImport> imports, Set<String> usedNames) {
+    // Third-party names imported without a prefix by any of the merged files, which a prefix would shadow.
+    final importedNames = {
+      for (final source in sources)
+        for (final import in source.result.libraryFragment.libraryImports)
+          if (import.prefix == null)
+            for (final entry in import.namespace.definedNames2.entries)
+              if (!_isMergedLibrary(entry.value.library)) entry.key.replaceAll('=', ''),
+    };
     final importsBySourcePrefix = <(_MergedSource, String), List<_MergedImport>>{};
     for (final import in imports) {
       final source = import.source, prefix = import.prefix;
@@ -640,15 +766,14 @@ class ProjectMerger {
       final isDeferred = entry.value.keys.any((binding) => binding.startsWith('deferred '));
       final groups = entry.value.values.toList();
       // Deferred prefixes can't be shared with any other import, even of the same library.
-      final renamedGroups = isDeferred
-          ? groups
-                .expand(
-                  (group) => [
-                    for (final source in group) [source],
-                  ],
-                )
-                .skip(1)
-          : groups.skip(1);
+      final separateGroups = isDeferred
+          ? [
+              for (final group in groups)
+                for (final source in group) [source],
+            ]
+          : groups;
+      // A prefix clashing with an imported name is renamed for all of the files.
+      final renamedGroups = importedNames.contains(prefix) ? separateGroups : separateGroups.skip(1);
       for (final group in renamedGroups) {
         var index = 1;
         var newPrefix = '${prefix}_$index';
@@ -694,9 +819,14 @@ class ProjectMerger {
     Map<String, analyzer_element.Element> exportedNames,
   ) {
     final prefixes = {for (final import in imports) ?import.prefix};
-    // First-party top-level declarations, in the order of declaration.
+    // First-party top-level declarations, in the order of declaration. The entry point files are ordered first,
+    // so that their `main` function keeps its name, if multiple libraries declare one.
     final declarations = <String, analyzer_element.Element>{};
-    for (final source in sources) {
+    final orderedSources = [
+      ...sources.where((source) => path.basename(source.filePath) == 'main.dart'),
+      ...sources.where((source) => path.basename(source.filePath) != 'main.dart'),
+    ];
+    for (final source in orderedSources) {
       for (final declaration in source.result.unit.declarations) {
         for (final (element, _) in _declaredTopLevelElements(declaration)) {
           declarations.putIfAbsent(_topLevelKey(element), () => element);
@@ -783,7 +913,13 @@ class ProjectMerger {
           ),
         );
         for (final elementReference in elementReferences) {
-          elementReference.source.addEdit(elementReference.offset, elementReference.offset, '$prefix.');
+          if (elementReference.isSimpleInterpolation) {
+            // `$name` is converted to `${prefix.name}`.
+            elementReference.source.addEdit(elementReference.offset, elementReference.offset, '{$prefix.', priority: 0);
+            elementReference.source.addEdit(elementReference.end, elementReference.end, '}');
+          } else {
+            elementReference.source.addEdit(elementReference.offset, elementReference.offset, '$prefix.');
+          }
         }
       }
     }
@@ -928,11 +1064,16 @@ class ProjectMerger {
     }
     final type = dart_io.FileSystemEntity.typeSync(sourcePath);
     if (type == dart_io.FileSystemEntityType.file) {
+      if (assetPath.endsWith('.dart')) {
+        print('Warning: Dart asset "$assetPath" of the ${package.name} package is not included, as it is not obfuscated.');
+        return false;
+      }
       dart_io.File(destinationPath).parent.createSync(recursive: true);
       dart_io.File(sourcePath).copySync(destinationPath);
     } else if (type == dart_io.FileSystemEntityType.directory) {
       for (final entity in dart_io.Directory(sourcePath).listSync(recursive: true)) {
-        if (entity is! dart_io.File) continue;
+        // Dart sources declared as assets (e.g., `lib/`) would leak the original code next to the merged file.
+        if (entity is! dart_io.File || entity.path.endsWith('.dart')) continue;
         final target = path.join(destinationPath, path.relative(entity.path, from: sourcePath));
         dart_io.File(target).parent.createSync(recursive: true);
         entity.copySync(target);
@@ -1028,6 +1169,20 @@ class ProjectMerger {
     // Development dependencies are not included, as the merged package contains no tests or tools, and they may
     // depend on the merged package itself (e.g., `test` on `args`), which would conflict with it.
     final dependencyOverrides = mergeDependencies((pubspec) => pubspec.dependencyOverrides);
+    // Local overrides (e.g., generated by melos) take precedence over the ones of the pubspec files.
+    for (final package in packages) {
+      final overridesFile = dart_io.File(path.join(package.sourceDirectory.path, 'pubspec_overrides.yaml'));
+      if (!overridesFile.existsSync()) continue;
+      final overrides = pubspec_parse.Pubspec.parse(
+        'name: overrides\n${overridesFile.readAsStringSync()}',
+        lenient: true,
+      ).dependencyOverrides;
+      for (final entry in overrides.entries) {
+        if (!sourcePackageNames.contains(entry.key)) {
+          dependencyOverrides[entry.key] = _dependencyToYamlNode(package, entry.value);
+        }
+      }
+    }
     final flutter = _mergeFlutterConfiguration();
 
     // A single package keeps its name, so that references to its own assets (e.g., `package: 'name'`) remain valid.
@@ -1065,9 +1220,10 @@ class ProjectMerger {
     final imports = <_MergedImport>[];
     final references = _prepareSources(sources, imports);
     final usedNames = {..._collector.usedIdentifiers};
-    _resolvePrefixClashes(imports, usedNames);
+    _resolvePrefixClashes(sources, imports, usedNames);
     _resolvePrivateMemberClashes(sources, usedNames);
-    _addPrivateMemberForwarders(sources);
+    _implementPrivateMembers(sources, usedNames);
+    _adaptLanguageVersions(sources);
     final exportedNames = <String, analyzer_element.Element>{};
     final exports = _publicExports(sources, exportedNames);
     _resolveNameClashes(sources, references, imports, usedNames, exportedNames);
@@ -1091,6 +1247,11 @@ class ProjectMerger {
       if (contents.isEmpty) continue;
       fileBuffer
         ..writeln(contents)
+        ..writeln();
+    }
+    for (final declaration in _additionalDeclarations) {
+      fileBuffer
+        ..writeln(declaration)
         ..writeln();
     }
 
@@ -1151,7 +1312,12 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
 
   /// Records a reference to the [element] named by the [token], if it's a top-level declaration.
   ///
-  void _record(analyzer_element.Element? element, analyzer_token.Token token, {required bool isPrefixed}) {
+  void _record(
+    analyzer_element.Element? element,
+    analyzer_token.Token token, {
+    required bool isPrefixed,
+    bool isSimpleInterpolation = false,
+  }) {
     final topLevelElement = ProjectMerger._topLevelElement(element);
     if (topLevelElement == null || token.lexeme != topLevelElement.name) return;
     // References through third-party import prefixes are not ambiguous.
@@ -1162,6 +1328,7 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
         offset: token.offset,
         end: token.end,
         element: topLevelElement,
+        isSimpleInterpolation: isSimpleInterpolation,
       ),
     );
   }
@@ -1208,6 +1375,18 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
       return collector.names;
     }
 
+    Iterable<analyzer_token.Token> statementNames(List<analyzer_ast.Statement> statements) => [
+      for (final statement in statements)
+        ...switch (statement) {
+          analyzer_ast.VariableDeclarationStatement(:final variables) => [
+            for (final variable in variables.variables) variable.name,
+          ],
+          analyzer_ast.FunctionDeclarationStatement(:final functionDeclaration) => [functionDeclaration.name],
+          analyzer_ast.PatternVariableDeclarationStatement() => patternVariables(statement),
+          _ => const <analyzer_token.Token>[],
+        },
+    ];
+
     for (analyzer_ast.AstNode? node = reference.parent; node != null; node = node.parent) {
       final isShadowing = switch (node) {
         analyzer_ast.ClassDeclaration(:final typeParameters) ||
@@ -1234,16 +1413,11 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
           ...typeParameterNames(typeParameters),
         ]),
         analyzer_ast.ConstructorDeclaration(:final parameters) => declares(parameterNames(parameters)),
-        analyzer_ast.Block(:final statements) => declares([
-          for (final statement in statements)
-            ...switch (statement) {
-              analyzer_ast.VariableDeclarationStatement(:final variables) => [
-                for (final variable in variables.variables) variable.name,
-              ],
-              analyzer_ast.FunctionDeclarationStatement(:final functionDeclaration) => [functionDeclaration.name],
-              analyzer_ast.PatternVariableDeclarationStatement() => patternVariables(statement),
-              _ => const <analyzer_token.Token>[],
-            },
+        analyzer_ast.Block(:final statements) => declares(statementNames(statements)),
+        // The statements of a switch case are a scope of their own, along with the pattern variables of the case.
+        analyzer_ast.SwitchMember(:final statements) => declares([
+          ...statementNames(statements),
+          if (node is analyzer_ast.SwitchPatternCase) ...patternVariables(node.guardedPattern),
         ]),
         analyzer_ast.ForStatement(:final forLoopParts) || analyzer_ast.ForElement(:final forLoopParts) => declares([
           ...switch (forLoopParts) {
@@ -1258,10 +1432,7 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
           exceptionParameter?.name,
           stackTraceParameter?.name,
         ]),
-        analyzer_ast.SwitchPatternCase() ||
-        analyzer_ast.SwitchExpressionCase() ||
-        analyzer_ast.IfStatement() ||
-        analyzer_ast.IfElement() => declares(patternVariables(node)),
+        analyzer_ast.SwitchExpressionCase() || analyzer_ast.IfStatement() || analyzer_ast.IfElement() => declares(patternVariables(node)),
         _ => false,
       };
       if (isShadowing) return true;
@@ -1312,7 +1483,27 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
     if (parent is analyzer_ast.PrefixedIdentifier && parent.identifier == node && !isPrefixed) return;
     if (parent is analyzer_ast.PropertyAccess && parent.propertyName == node) return;
     if (parent is analyzer_ast.MethodInvocation && parent.methodName == node && parent.target != null && !isPrefixed) return;
-    _record(resolved, node.token, isPrefixed: isPrefixed);
+    _record(
+      resolved,
+      node.token,
+      isPrefixed: isPrefixed,
+      isSimpleInterpolation: parent is analyzer_ast.InterpolationExpression && parent.rightBracket == null,
+    );
+  }
+
+  @override
+  void visitExtensionOverride(analyzer_ast.ExtensionOverride node) {
+    final importPrefix = node.importPrefix;
+    var isPrefixed = importPrefix != null;
+    if (importPrefix != null) {
+      if (_removePrefix(importPrefix.name, importPrefix.period, node.element, node, node.name.lexeme)) {
+        isPrefixed = false;
+      } else {
+        _recordPrefixUsage(importPrefix.name);
+      }
+    }
+    _record(node.element, node.name, isPrefixed: isPrefixed);
+    super.visitExtensionOverride(node);
   }
 
   @override
@@ -1382,7 +1573,21 @@ class _PrivateMemberVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
 
   @override
   void visitSimpleIdentifier(analyzer_ast.SimpleIdentifier node) {
-    _rename(node.element ?? ObjectCollector.assignedElement(node), node.token);
+    final element = node.element ?? ObjectCollector.assignedElement(node);
+    if (element != null) {
+      _rename(element, node.token);
+      return;
+    }
+    // A dynamic access to a private member (e.g., `(value as dynamic)._name`) refers to the members of this library.
+    final parent = node.parent;
+    final isMemberAccess =
+        parent is analyzer_ast.PropertyAccess && parent.propertyName == node ||
+        parent is analyzer_ast.PrefixedIdentifier &&
+            parent.identifier == node &&
+            parent.prefix.element is! analyzer_element.PrefixElement ||
+        parent is analyzer_ast.MethodInvocation && parent.methodName == node && (parent.target != null || parent.isCascaded);
+    final newName = renames['${source.result.libraryElement.uri}#${node.name}'];
+    if (isMemberAccess && newName != null) source.addEdit(node.offset, node.end, newName);
   }
 
   @override
@@ -1410,7 +1615,12 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
     required this.source,
     required this.memberNames,
     required this.overrideName,
+    required this.explicitOffsets,
   });
+
+  /// Positions of the invocations on the implicit `this` made explicit, which don't need other qualification.
+  ///
+  final Set<(_MergedSource, int)> explicitOffsets;
 
   final _MergedSource source;
 
@@ -1447,18 +1657,70 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
     required String name,
     required analyzer_ast.Expression? target,
     required bool isCascaded,
+    required analyzer_token.Token nameToken,
   }) {
     final extension = _extensionOf(element);
     if (extension == null || !memberNames.contains(name) || target is analyzer_ast.ExtensionOverride) return;
-    // Members invoked on the implicit `this` are declared by the enclosing extension, resolved lexically.
-    if (target == null && !isCascaded) return;
+    final isImplicitThis = target == null && !isCascaded;
+    if (isImplicitThis) {
+      // Members of the enclosing extension itself are resolved lexically.
+      final enclosing = node.thisOrAncestorOfType<analyzer_ast.CompilationUnitMember>()?.declaredFragment?.element;
+      if (enclosing is analyzer_element.ExtensionElement &&
+          ProjectMerger._extensionKey(enclosing) == ProjectMerger._extensionKey(extension)) {
+        return;
+      }
+    }
     final extensionName = overrideName(extension);
     if (isCascaded || target is analyzer_ast.SuperExpression || extensionName == null) {
       _warn(node, name);
       return;
     }
+    if (isImplicitThis) {
+      // An invocation on the implicit `this` (e.g., `describe()` in a class) is applied explicitly to `this`.
+      explicitOffsets.add((source, nameToken.offset));
+      final parent = node.parent;
+      if (parent is analyzer_ast.InterpolationExpression && parent.rightBracket == null) {
+        source.addEdit(nameToken.offset, nameToken.offset, '{$extensionName(this).', priority: 0);
+        source.addEdit(nameToken.end, nameToken.end, '}');
+      } else {
+        source.addEdit(nameToken.offset, nameToken.offset, '$extensionName(this).', priority: 0);
+      }
+      return;
+    }
     source.addEdit(target!.offset, target.offset, '$extensionName(', priority: 0);
     source.addEdit(target.end, target.end, ')');
+  }
+
+  @override
+  void visitComment(analyzer_ast.Comment node) {}
+
+  @override
+  void visitSimpleIdentifier(analyzer_ast.SimpleIdentifier node) {
+    final parent = node.parent;
+    // Getters and setters invoked on the implicit `this`, the other forms are handled by their parents.
+    if (parent is analyzer_ast.PrefixedIdentifier && parent.identifier == node ||
+        parent is analyzer_ast.PropertyAccess && parent.propertyName == node ||
+        parent is analyzer_ast.MethodInvocation && parent.methodName == node ||
+        parent is analyzer_ast.Label) {
+      return;
+    }
+    _override(
+      node: node,
+      element: node.element ?? ObjectCollector.assignedElement(node),
+      name: node.name,
+      target: null,
+      isCascaded: false,
+      nameToken: node.token,
+    );
+  }
+
+  @override
+  void visitPatternField(analyzer_ast.PatternField node) {
+    // Extension getters can't be applied explicitly in object patterns.
+    final extension = _extensionOf(node.element);
+    final name = node.element?.name;
+    if (extension != null && name != null && memberNames.contains(name)) _warn(node, name);
+    super.visitPatternField(node);
   }
 
   @override
@@ -1475,6 +1737,7 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
       name: node.methodName.name,
       target: node.target,
       isCascaded: node.isCascaded,
+      nameToken: node.methodName.token,
     );
     super.visitMethodInvocation(node);
   }
@@ -1487,6 +1750,7 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
       name: node.propertyName.name,
       target: node.target,
       isCascaded: node.isCascaded,
+      nameToken: node.propertyName.token,
     );
     super.visitPropertyAccess(node);
   }
@@ -1499,6 +1763,7 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
       name: node.identifier.name,
       target: node.prefix,
       isCascaded: false,
+      nameToken: node.identifier.token,
     );
     super.visitPrefixedIdentifier(node);
   }
@@ -1590,7 +1855,7 @@ class _ImplicitThisVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
     final enclosingElement = enclosingDeclaration?.declaredFragment?.element;
     if (enclosingElement == null || enclosingElement == declarer.baseElement) return;
     final name = merger._mergedMemberName(declarer, node.name);
-    if (!scopeNames.contains(name)) return;
+    if (!scopeNames.contains(name) || merger._explicitExtensionOffsets.contains((source, node.offset))) return;
     if (parent is analyzer_ast.InterpolationExpression && parent.rightBracket == null) {
       // Simple interpolation (e.g., `$position`) is converted to `${this.position}`.
       source.addEdit(node.offset, node.offset, '{this.', priority: 0);

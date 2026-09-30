@@ -250,8 +250,10 @@ https://github.com/ljmatan/obfuscator/tree/main/output
   are not handled.
 - **Merged output**: the merged file is a single library. Clashing top-level names, private members and import
   prefixes are renamed, and extension member invocations which could resolve differently are made explicit.
-  Library-level annotations, conditional imports of first-party libraries, and extension operators or cascaded
-  extension invocations (reported with a warning) may need manual adjustments.
+  Library-level annotations, conditional imports of first-party libraries, and extension operators, cascaded
+  extension invocations or extension getters in object patterns (reported with a warning) may need manual
+  adjustments. Libraries opted into older language versions (`// @dart=2.19`) are adapted to the language
+  version of the merged file, while libraries without null safety can't be merged.
   The `flutter: generate: true` (localizations) setting is not supported.
 - **Legal**: ensure you have the right to obfuscate and distribute any source code; follow licenses and agreements.
 

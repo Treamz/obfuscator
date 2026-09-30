@@ -258,6 +258,16 @@ void main() {
     });
   });
 
+  group('merge edge cases fixture', () {
+    test('keeps the program valid and its behaviour unchanged', () async {
+      final source = await _prepareFixture('merge_edge');
+      final output = path.join(_temp.path, 'out_merge_edge');
+      final result = await _obfuscate(['--src=$source', '--out=$output', '--seed=4']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      await _verifyOutput(source: source, copy: path.join(output, 'copy', 'merge_edge'), output: output);
+    });
+  });
+
   group('multiple packages', () {
     test('are obfuscated consistently, including packages with the same directory name', () async {
       final root = await _prepareFixture('multi');
@@ -446,6 +456,54 @@ void main() {
       final result = await _obfuscate(['--src=$root', '--out=$output']);
       expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
       expect('${result.stdout}', contains('is not a valid pubspec.yaml file'));
+    });
+
+    test('resolves the local pubspec overrides from the copy', () async {
+      final package = await _prepareFixture('multi', name: 'overrides');
+      final root = path.join(package, 'two', 'shared');
+      final pubspec = File(path.join(root, 'pubspec.yaml'));
+      pubspec.writeAsStringSync(pubspec.readAsStringSync().replaceFirst('    path: ../../one/shared\n', '    path: ../missing\n'));
+      File(path.join(root, 'pubspec_overrides.yaml')).writeAsStringSync(
+        'dependency_overrides:\n  shared_one:\n    path: ../../one/shared\n',
+      );
+      final output = path.join(_temp.path, 'out_overrides');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(await _errors(output, 'lib/merged.dart'), isEmpty);
+    });
+
+    test('copies symbolic links to library sources as files, never writing through them', () async {
+      if (Platform.isWindows) return;
+      final package = await _prepareFixture('multi', name: 'library_links');
+      final root = path.join(package, 'one', 'shared');
+      final shared = File(path.join(package, 'shared_code', 'greeter.dart'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync('class Greeter {\n  String greet() => \'hi\';\n}\n');
+      Link(path.join(root, 'lib', 'greeter.dart')).createSync(shared.path);
+      File(path.join(root, 'lib', 'use_greeter.dart')).writeAsStringSync(
+        "import 'greeter.dart';\n\nString useGreeter() => Greeter().greet();\n",
+      );
+      final output = path.join(_temp.path, 'out_library_links');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(shared.readAsStringSync(), contains('class Greeter'));
+      final copied = File(path.join(output, 'copy', 'shared', 'lib', 'greeter.dart'));
+      expect(FileSystemEntity.isLinkSync(copied.path), isFalse);
+      expect(copied.readAsStringSync(), isNot(contains('Greeter')));
+      expect(await _errors(output, 'lib/merged.dart'), isEmpty);
+    });
+
+    test('never copies Dart sources declared as assets', () async {
+      final package = await _prepareFixture('multi', name: 'dart_assets');
+      final root = path.join(package, 'one', 'shared');
+      final pubspec = File(path.join(root, 'pubspec.yaml'));
+      pubspec.writeAsStringSync('${pubspec.readAsStringSync()}flutter:\n  assets:\n    - lib/\n');
+      File(path.join(root, 'lib', 'data.json')).writeAsStringSync('{}');
+      final output = path.join(_temp.path, 'out_dart_assets');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(File(path.join(output, 'lib', 'shared_one.dart')).existsSync(), isFalse);
+      expect(File(path.join(output, 'lib', 'data.json')).existsSync(), isTrue);
     });
 
     test('reports conflicting dependency declarations', () async {
