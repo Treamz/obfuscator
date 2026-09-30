@@ -9,11 +9,13 @@ import 'shared/first.dart';
 import 'shared/local.dart';
 import 'shared/other.dart';
 import 'speed_first.dart';
+import 'src/root_relative.dart';
 import 'speed_second.dart';
 import 'stubs/config.dart';
 import 'stubs/fake_repository.dart';
 import 'stubs/fixed_config.dart';
 import 'dev_ext.dart';
+import 'dev_ext_barrel.dart';
 import 'dev_ext_prefixed.dart';
 import 'fake_service.dart';
 import 'fixed_holder.dart';
@@ -81,6 +83,7 @@ Future<void> main() async {
     'configs ${const <Config>[Config('x'), Config(), fixedConfig].map((config) => config.value).join(' ')}',
     'speed ${Stopwatch2().run()} ${Runner().run()}',
     'shared ${sharedLocal('a')} ${sharedOther('b')} ${sharedFirst('c')}',
+    'barrel ${loudBarrel()} ${rootRelative()}',
     'walker ${Walker().walk([1, 2, 3])} ${current()}',
   ]) {
     print(line);

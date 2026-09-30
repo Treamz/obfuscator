@@ -470,8 +470,18 @@ class ProjectMerger {
           if (imported is! analyzer_element.ExtensionElement || _extensionKey(imported) != key) continue;
           if (prefix == null) {
             // A dedicated import prefix avoids clashes with other declarations of the same name.
-            final uri = import.importedLibrary?.uri.toString();
-            if (uri == null) return null;
+            final importedLibrary = import.importedLibrary;
+            if (importedLibrary == null) return null;
+            var uri = importedLibrary.uri.toString();
+            if (_isMergedLibrary(importedLibrary)) {
+              // The extension is re-exported by a merged library, it's imported from the exporting library.
+              final export = _externalExports(importedLibrary).where((export) {
+                final exported = _exportedElements(export)[name];
+                return exported is analyzer_element.ExtensionElement && _extensionKey(exported) == key;
+              }).firstOrNull;
+              if (export == null) return null;
+              uri = export.library.uri.toString();
+            }
             final dedicatedPrefix = extensionPrefixes.putIfAbsent(uri, () {
               final prefix = uniqueName('_merged_extensions');
               imports.add(
@@ -651,7 +661,8 @@ class ProjectMerger {
   ///
   void _adaptLanguageVersions(List<_MergedSource> sources, List<_MergedImport> imports, Set<String> usedNames) {
     final renamedPrefixLibraries = <Uri>{};
-    final mergedVersion = _highestLowerBound(_configuration.packages.map((package) => package.pubspec.environment['sdk']));
+    final legacySources = <_MergedSource>[];
+    final mergedVersion = _mergedLanguageVersion(sources);
     final wildcardVersion = pub_semver.Version(3, 7, 0);
     final reportedVersions = <String>{};
     final mixinKeys = <String>{
@@ -701,13 +712,88 @@ class ProjectMerger {
       if (version < pub_semver.Version(2, 12, 0)) {
         print('Warning: ${source.filePath} uses the language version $version without null safety, which can\'t be merged.');
       }
+      // Class modifiers are only adapted for merged files of Dart 3.0 or newer.
+      if (mergedVersion == null || mergedVersion.major < 3) continue;
+      legacySources.add(source);
       for (final declaration in source.result.unit.declarations.whereType<analyzer_ast.ClassDeclaration>()) {
         final element = _topLevelElement(declaration.declaredFragment?.element);
         if (element != null && declaration.mixinKeyword == null && mixinKeys.contains(_topLevelKey(element))) {
           source.addEdit(declaration.classKeyword.offset, declaration.classKeyword.offset, 'mixin ');
         }
+        _adaptLegacySdkSupertypes(source, declaration);
       }
     }
+    _addLegacyBaseModifiers(legacySources);
+  }
+
+  /// Adapts a class of a library older than Dart 3.0, which was exempt from the class modifiers of the platform
+  /// libraries, extending an `interface` class (e.g., `extends Iterator<int>`), to implement it instead.
+  ///
+  void _adaptLegacySdkSupertypes(_MergedSource source, analyzer_ast.ClassDeclaration declaration) {
+    final extendsClause = declaration.extendsClause;
+    final superclass = extendsClause?.superclass.element;
+    if (extendsClause == null ||
+        superclass is! analyzer_element.ClassElement ||
+        !superclass.isInterface ||
+        superclass.library.uri.scheme != 'dart') {
+      return;
+    }
+    if (declaration.withClause != null) {
+      _warnAtNode(source, declaration, 'extends the interface class ${superclass.name} along with mixins, which must be adapted manually');
+      return;
+    }
+    source.addEdit(extendsClause.extendsKeyword.offset, extendsClause.extendsKeyword.end, 'implements');
+    final implementsClause = declaration.implementsClause;
+    if (implementsClause != null) {
+      source.addEdit(implementsClause.implementsKeyword.offset, implementsClause.implementsKeyword.end, ',');
+    }
+  }
+
+  /// Declares the classes of libraries older than Dart 3.0 which are subtypes of `base` or `final` platform classes
+  /// (e.g., `extends LinkedListEntry`) as `base`, along with their subclasses.
+  ///
+  void _addLegacyBaseModifiers(List<_MergedSource> legacySources) {
+    final baseKeys = <String>{};
+    bool isRestricted(analyzer_element.InterfaceElement element) {
+      if (baseKeys.contains(classKeyOf(element))) return true;
+      if (element.library.uri.scheme != 'dart') return false;
+      return element is analyzer_element.ClassElement && (element.isBase || element.isFinal) ||
+          element is analyzer_element.MixinElement && element.isBase;
+    }
+
+    var changed = true;
+    while (changed) {
+      changed = false;
+      for (final source in legacySources) {
+        for (final declaration in source.result.unit.declarations.whereType<analyzer_ast.ClassDeclaration>()) {
+          final element = declaration.declaredFragment?.element;
+          if (element == null || baseKeys.contains(classKeyOf(element))) continue;
+          if (declaration.baseKeyword != null || declaration.finalKeyword != null || declaration.sealedKeyword != null) {
+            continue;
+          }
+          if (!element.allSupertypes.any((type) => isRestricted(type.element))) continue;
+          baseKeys.add(classKeyOf(element));
+          changed = true;
+          final implemented = declaration.implementsClause?.interfaces.map((type) => type.element);
+          if (implemented != null && implemented.any((type) => type is analyzer_element.InterfaceElement && isRestricted(type))) {
+            _warnAtNode(source, declaration, 'implements a base class, which must be adapted manually');
+          }
+          final keyword = declaration.mixinKeyword ?? declaration.classKeyword;
+          source.addEdit(keyword.offset, keyword.offset, 'base ', priority: 0);
+        }
+      }
+    }
+  }
+
+  /// Unique identifier of a class-like [element].
+  ///
+  static String classKeyOf(analyzer_element.InterfaceElement element) => '${element.library.uri}#${element.name}';
+
+  /// Reports a construct of the [source] at the [node] which can't be merged automatically.
+  ///
+  static void _warnAtNode(_MergedSource source, analyzer_ast.AstNode node, String message) {
+    final location = source.result.lineInfo.getLocation(node.offset);
+    print('Warning: ${source.filePath}:${location.lineNumber}: the declaration $message.');
   }
 
   /// Declarations added to the merged file, e.g., the mixin providing the `noSuchMethod` forwarders.
@@ -912,6 +998,8 @@ class ProjectMerger {
                 '${isUnnamed ? '' : ' : super.${constructor.name}()'};\n',
               );
             }
+            // Super parameters require Dart 2.17.
+            _requireLanguageVersion(pub_semver.Version(2, 17, 0));
             source.addEdit(equals.offset, equals.end, 'extends');
             source.addEdit(semicolon.offset, semicolon.end, ' {$forwarders$stubs}');
           case analyzer_ast.ClassTypeAlias(:final withClause):
@@ -1179,9 +1267,39 @@ class ProjectMerger {
     );
   }
 
+  /// Resolved sources of the merged file.
+  ///
+  List<_MergedSource> _mergedSources = const [];
+
+  /// Minimum language version required by the code generated by the merger.
+  ///
+  pub_semver.Version? _requiredLanguageVersion;
+
+  void _requireLanguageVersion(pub_semver.Version version) {
+    final required = _requiredLanguageVersion;
+    if (required == null || version > required) _requiredLanguageVersion = version;
+  }
+
+  /// Language version of the merged file: the highest lower SDK bound of the packages, the highest language
+  /// version of the merged libraries (e.g., opted in with `// @dart=3.10`), and the version the merger requires.
+  ///
+  pub_semver.Version? _mergedLanguageVersion(List<_MergedSource> sources) {
+    var version = _highestLowerBound(_configuration.packages.map((package) => package.pubspec.environment['sdk']));
+    for (final source in sources) {
+      final effective = source.result.libraryElement.languageVersion.effective;
+      final libraryVersion = pub_semver.Version(effective.major, effective.minor, 0);
+      if (version == null || libraryVersion > version) version = libraryVersion;
+    }
+    final required = _requiredLanguageVersion;
+    if (required != null && (version == null || required > version)) version = required;
+    return version;
+  }
+
   /// Adds the [members] to an enum [declaration], separating them from the values if needed.
   ///
-  static void _addEnumMembers(_MergedSource source, analyzer_ast.EnumDeclaration declaration, String members) {
+  void _addEnumMembers(_MergedSource source, analyzer_ast.EnumDeclaration declaration, String members) {
+    // Enum members and `EnumName` require Dart 2.17.
+    _requireLanguageVersion(pub_semver.Version(2, 17, 0));
     final offset = declaration.rightBracket.offset;
     if (declaration.semicolon == null) source.addEdit(offset, offset, ';', priority: 0);
     source.addEdit(offset, offset, members);
@@ -1431,7 +1549,9 @@ class ProjectMerger {
       for (final package in packages) {
         for (final entry in section(package.pubspec).entries) {
           if (sourcePackageNames.contains(entry.key)) continue;
-          final node = _dependencyToYamlNode(package, entry.value);
+          // Members of the same pub workspace are resolved from their locations.
+          final workspaceMember = package.workspaceDependencies[entry.key];
+          final node = workspaceMember == null ? _dependencyToYamlNode(package, entry.value) : {'path': workspaceMember};
           final existing = result[entry.key];
           if (!result.containsKey(entry.key)) {
             result[entry.key] = node;
@@ -1454,7 +1574,7 @@ class ProjectMerger {
       return result;
     }
 
-    final sdkMinimum = _highestLowerBound(packages.map((package) => package.pubspec.environment['sdk']));
+    final sdkMinimum = _mergedLanguageVersion(_mergedSources);
     final environment = <String, Object?>{
       'sdk': sdkMinimum == null ? '^3.0.0' : '>=$sdkMinimum <${dart_math.max(4, sdkMinimum.major + 1)}.0.0',
     };
@@ -1518,7 +1638,7 @@ class ProjectMerger {
     final collection = analyzer_context.AnalysisContextCollection(
       includedPaths: [for (final package in _configuration.packages) package.copyDirectory.path],
     );
-    final sources = await _resolveSources(collection);
+    final sources = _mergedSources = await _resolveSources(collection);
     final imports = <_MergedImport>[];
     final references = _prepareSources(sources, imports);
     final usedNames = {..._collector.usedIdentifiers};

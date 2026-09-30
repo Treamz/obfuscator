@@ -16,6 +16,7 @@ import 'package:core/redirect.dart';
 import 'package:core/shadow.dart';
 import 'package:core/shapes.dart';
 import 'package:core/supers.dart';
+import 'package:core/tear_offs.dart';
 
 void main() {
   for (final line in [
@@ -37,6 +38,7 @@ void main() {
     ...shadowReport(),
     ...shapesReport(),
     ...supersReport(),
+    ...tearOffsReport(),
   ]) {
     print(line);
   }

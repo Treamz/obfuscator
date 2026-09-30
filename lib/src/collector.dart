@@ -798,11 +798,35 @@ class _DynamicAccessVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
 
   @override
   void visitNamedExpression(analyzer_ast.NamedExpression node) {
-    // A named argument of a dynamic invocation (e.g., of a `Function` value) can't be matched to its parameter,
-    // which may be an initializing formal of a field (e.g., `builders['user']!(id: 7)` for `User.new`).
+    // A named argument of a dynamic invocation (e.g., of a `Function` value), or of a function type, can't be
+    // matched to the parameter of the invoked function, which may be an initializing formal of a field
+    // (e.g., `builders['user']!(id: 7)` or `(switch (x) { _ => User.new })(id: 7)` for `User.new`).
     final label = node.name.label;
-    if (label.element == null && node.parent is analyzer_ast.ArgumentList) names.add(label.name);
+    final element = label.element;
+    if (node.parent is analyzer_ast.ArgumentList &&
+        (element == null || element is analyzer_element.FormalParameterElement && element.enclosingElement is! analyzer_element.ExecutableElement)) {
+      names.add(label.name);
+    }
     super.visitNamedExpression(node);
+  }
+
+  @override
+  void visitGenericFunctionType(analyzer_ast.GenericFunctionType node) {
+    // Constructor tear-offs assigned to function types must keep the names of their named parameters.
+    for (final parameter in node.parameters.parameters) {
+      final name = parameter.name;
+      if (parameter.isNamed && name != null) names.add(name.lexeme);
+    }
+    super.visitGenericFunctionType(node);
+  }
+
+  @override
+  void visitFunctionTypedFormalParameter(analyzer_ast.FunctionTypedFormalParameter node) {
+    for (final parameter in node.parameters.parameters) {
+      final name = parameter.name;
+      if (parameter.isNamed && name != null) names.add(name.lexeme);
+    }
+    super.visitFunctionTypedFormalParameter(node);
   }
 }
 

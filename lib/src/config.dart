@@ -8,6 +8,7 @@ import 'package:dart_style/dart_style.dart' as dart_style;
 import 'package:path/path.dart' as path;
 import 'package:obfuscator/src/annotation.dart';
 import 'package:pubspec_parse/pubspec_parse.dart' as pubspec_parse;
+import 'package:package_config/package_config.dart' as package_config;
 import 'package:yaml_edit/yaml_edit.dart' as yaml_edit;
 
 /// Error raised for invalid input or environment, reported to the user without a stack trace.
@@ -46,6 +47,11 @@ class SourcePackage {
   /// Location of the copied (obfuscated) package sources.
   ///
   late dart_io.Directory copyDirectory;
+
+  /// Locations of the dependencies which are members of the same pub workspace, resolved by the workspace
+  /// rather than by their declarations (e.g., `core: ^1.0.0`), mapped by their names.
+  ///
+  final workspaceDependencies = <String, String>{};
 
   /// Locations of the packages nested within the [copyDirectory] (e.g., `example`).
   ///
@@ -410,6 +416,7 @@ class Configuration {
     required String copyDirectory,
     required String originalDirectory,
     required bool keepWorkspaceResolution,
+    Map<String, String> workspaceDependencies = const {},
   }) {
     final pubspecFile = dart_io.File(path.join(copyDirectory, 'pubspec.yaml'));
     final editor = _parseYaml(pubspecFile);
@@ -420,6 +427,16 @@ class Configuration {
     }
     if (contents['resolution'] == 'workspace' && !keepWorkspaceResolution) {
       editor.remove(['resolution']);
+      // Without the workspace, its members are resolved with path overrides.
+      if (workspaceDependencies.isNotEmpty && contents['dependency_overrides'] is! Map) {
+        editor.update(['dependency_overrides'], <String, Object?>{});
+      }
+      for (final entry in workspaceDependencies.entries) {
+        editor.update(
+          ['dependency_overrides', entry.key],
+          {'path': resolveDependencyPath(baseDirectory: originalDirectory, dependencyPath: entry.value, preferCopies: true)},
+        );
+      }
     }
     _rewritePathDependencies(
       editor: editor,
@@ -532,9 +549,36 @@ class Configuration {
     );
   }
 
+  /// Value of the top-level [key] of the YAML [file], if it's a valid YAML map.
+  ///
+  static Object? _yamlValue(dart_io.File file, String key) {
+    final contents = _parseYaml(file)?.parseAt([]).value;
+    return contents is Map ? contents[key] : null;
+  }
+
+  /// Finds the dependencies of the [package] which are members of the same pub workspace.
+  ///
+  static Future<void> _findWorkspaceDependencies(SourcePackage package) async {
+    final pubspecFile = dart_io.File(path.join(package.sourceDirectory.path, 'pubspec.yaml'));
+    if (_yamlValue(pubspecFile, 'resolution') != 'workspace') return;
+    final packageConfig = await package_config.findPackageConfig(package.sourceDirectory);
+    if (packageConfig == null) return;
+    for (final entry in {...package.pubspec.dependencies, ...package.pubspec.devDependencies}.entries) {
+      if (entry.value is! pubspec_parse.HostedDependency) continue;
+      final root = packageConfig[entry.key]?.root;
+      if (root == null || root.scheme != 'file') continue;
+      final memberPubspec = dart_io.File(path.join(root.toFilePath(), 'pubspec.yaml'));
+      if (!memberPubspec.existsSync()) continue;
+      if (_yamlValue(memberPubspec, 'resolution') == 'workspace') package.workspaceDependencies[entry.key] = path.normalize(root.toFilePath());
+    }
+  }
+
   /// Define locations and copy source code directories to the newly-created `copy` folder.
   ///
   Future<void> _initialiseSourceDirectoriesCopy() async {
+    for (final package in packages) {
+      await _findWorkspaceDependencies(package);
+    }
     sourceDirectoriesCopy = dart_io.Directory(
       path.join(outputDirectory.path, 'copy'),
     )..createSync(recursive: true);
@@ -559,6 +603,7 @@ class Configuration {
         copyDirectory: package.copyDirectory.path,
         originalDirectory: package.sourceDirectory.path,
         keepWorkspaceResolution: false,
+        workspaceDependencies: package.workspaceDependencies,
       );
       _updateRelativeUris(package);
       _findNestedPackages(package, package.copyDirectory);
@@ -655,10 +700,13 @@ class Configuration {
         ];
         for (final literal in literals) {
           final value = literal.stringValue;
-          if (value == null || Uri.tryParse(value)?.hasScheme != false) continue;
+          // Root-relative URIs (e.g., `/theme.dart`) are resolved from the package root, not from the file.
+          if (value == null || value.startsWith('/') || Uri.tryParse(value)?.hasScheme != false) continue;
           final target = path.normalize(path.join(originalDirectory, value));
           if (path.isWithin(package.sourceDirectory.path, target)) continue;
-          edits.add((offset: literal.offset, end: literal.end, text: "'${Uri.file(target)}'"));
+          // Files of the other obfuscated packages are referenced in their copies.
+          final copyTarget = resolveDependencyPath(baseDirectory: originalDirectory, dependencyPath: value, preferCopies: true);
+          edits.add((offset: literal.offset, end: literal.end, text: "'${Uri.file(copyTarget)}'"));
         }
       }
       if (edits.isEmpty) continue;

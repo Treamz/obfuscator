@@ -67,6 +67,20 @@ Future<String> _runDart(String workingDirectory, String file) async {
   return result.stdout as String;
 }
 
+/// Writes the [files] (relative paths mapped to contents) to the [root] directory, and resolves the dependencies
+/// of its packages, listed with [packages] (relative paths).
+Future<void> _writePackages(String root, Map<String, String> files, List<String> packages) async {
+  for (final entry in files.entries) {
+    File(path.join(root, entry.key))
+      ..createSync(recursive: true)
+      ..writeAsStringSync(entry.value);
+  }
+  for (final package in packages) {
+    final result = await _run('dart', ['pub', 'get', '--offline'], workingDirectory: path.join(root, package));
+    expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+  }
+}
+
 /// Contents of all Dart files in the [directory], concatenated.
 String _sources(String directory) {
   return [
@@ -578,6 +592,135 @@ void main() {
       final result = await _obfuscate(['--src=${root.path}', '--out=$output']);
       expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
       expect(await _runDart(path.join(output, 'copy', 'pkg'), 'bin/tool.dart'), 'HI\n');
+    });
+
+    test('resolves workspace members depending on each other by version', () async {
+      final root = path.join(_temp.path, 'workspace_versions');
+      await _writePackages(
+        root,
+        {
+          'pubspec.yaml': 'name: ws\npublish_to: none\nenvironment:\n  sdk: ^3.10.0\nworkspace:\n  - packages/core\n  - packages/app\n',
+          'packages/core/pubspec.yaml':
+              'name: ws_core\nversion: 1.0.0\npublish_to: none\nresolution: workspace\nenvironment:\n  sdk: ^3.10.0\n',
+          'packages/core/lib/core.dart': 'class Money {\n  const Money(this.cents);\n\n  final int cents;\n}\n',
+          'packages/app/pubspec.yaml':
+              'name: ws_app\npublish_to: none\nresolution: workspace\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n  ws_core: ^1.0.0\n',
+          'packages/app/lib/main.dart': "import 'package:ws_core/core.dart';\n\nvoid main() => print(const Money(1234).cents);\n",
+        },
+        ['.'],
+      );
+      for (final sources in [
+        [path.join(root, 'packages', 'core'), path.join(root, 'packages', 'app')],
+        [path.join(root, 'packages', 'app')],
+      ]) {
+        final output = path.join(_temp.path, 'out_workspace_versions_${sources.length}');
+        final result = await _obfuscate(['--src=${sources.join(',')}', '--out=$output']);
+        expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+        expect(await _runDart(path.join(output, 'copy', 'app'), 'lib/main.dart'), '1234\n');
+        expect(await _runDart(output, 'lib/merged.dart'), '1234\n');
+      }
+    });
+
+    test('uses the language versions of libraries newer than the package constraint', () async {
+      final root = path.join(_temp.path, 'newer_version');
+      await _writePackages(
+        root,
+        {
+          'pubspec.yaml': "name: newer_version\nenvironment:\n  sdk: '>=3.0.0 <4.0.0'\n",
+          'lib/main.dart': '// @dart=3.10\nenum Mode { a, b }\n\nvoid main() {\n  Mode mode = .b;\n  print(mode);\n}\n',
+        },
+        ['.'],
+      );
+      final output = path.join(_temp.path, 'out_newer_version');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(await _runDart(output, 'lib/merged.dart'), 'Mode.b\n');
+    });
+
+    test('adapts pre-3.0 libraries extending platform classes with class modifiers', () async {
+      final root = path.join(_temp.path, 'legacy_modifiers');
+      await _writePackages(
+        root,
+        {
+          'legacy/pubspec.yaml': "name: legacy\nenvironment:\n  sdk: '>=2.19.0 <4.0.0'\n",
+          'legacy/lib/legacy.dart': r'''
+import 'dart:collection';
+
+class Countdown extends Iterator<int> {
+  Countdown(this._value);
+
+  int _value;
+
+  @override
+  int get current => _value;
+
+  @override
+  bool moveNext() => --_value >= 0;
+}
+
+class Entry extends LinkedListEntry<Entry> {
+  Entry(this.label);
+
+  final String label;
+}
+
+String describeLegacy() {
+  final countdown = Countdown(3);
+  final values = <int>[];
+  while (countdown.moveNext()) {
+    values.add(countdown.current);
+  }
+  final list = LinkedList<Entry>()..addAll([Entry('a'), Entry('b')]);
+  return '$values ${list.map((entry) => entry.label).join()}';
+}
+''',
+          'app/pubspec.yaml': 'name: legacy_app\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n  legacy:\n    path: ../legacy\n',
+          'app/lib/main.dart': "import 'package:legacy/legacy.dart';\n\nvoid main() => print(describeLegacy());\n",
+        },
+        ['legacy', 'app'],
+      );
+      final output = path.join(_temp.path, 'out_legacy_modifiers');
+      final result = await _obfuscate(['--src=${path.join(root, 'legacy')},${path.join(root, 'app')}', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(await _runDart(output, 'lib/merged.dart'), '[2, 1, 0] ab\n');
+    });
+
+    test('keeps enhanced enum members of merged packages older than Dart 2.17 valid', () async {
+      final root = path.join(_temp.path, 'old_enums');
+      await _writePackages(
+        root,
+        {
+          'pubspec.yaml': "name: old_enums\nenvironment:\n  sdk: '>=2.12.0 <4.0.0'\n",
+          'lib/a.dart': "enum Mode { fast, slow }\n\nString modeA() => '\${Mode.fast}';\n",
+          'lib/b.dart': "enum Mode { on, off }\n\nString modeB() => '\${Mode.off}';\n",
+          'lib/main.dart': "import 'a.dart';\nimport 'b.dart';\n\nvoid main() => print('\${modeA()} \${modeB()}');\n",
+        },
+        ['.'],
+      );
+      final output = path.join(_temp.path, 'out_old_enums');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(await _runDart(output, 'lib/merged.dart'), 'Mode.fast Mode.off\n');
+    });
+
+    test('maps relative URIs into other obfuscated packages to their copies', () async {
+      final root = path.join(_temp.path, 'relative_other');
+      await _writePackages(
+        root,
+        {
+          'core/pubspec.yaml': 'name: rel_core\nenvironment:\n  sdk: ^3.10.0\n',
+          'core/lib/core.dart': 'class Account {\n  Account(this.owner);\n\n  final String owner;\n}\n',
+          'core/test/fixtures.dart': "import 'package:rel_core/core.dart';\n\nAccount sampleAccount() => Account('ann');\n",
+          'app/pubspec.yaml': 'name: rel_app\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n  rel_core:\n    path: ../core\n',
+          'app/lib/main.dart': 'void main() {}\n',
+          'app/test/app_test.dart': "import '../../core/test/fixtures.dart';\n\nvoid main() => print(sampleAccount().owner);\n",
+        },
+        ['core', 'app'],
+      );
+      final output = path.join(_temp.path, 'out_relative_other');
+      final result = await _obfuscate(['--src=${path.join(root, 'core')},${path.join(root, 'app')}', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(await _runDart(path.join(output, 'copy', 'app'), 'test/app_test.dart'), 'ann\n');
     });
 
     test('reports conflicting dependency declarations', () async {

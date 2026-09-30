@@ -248,9 +248,11 @@ https://github.com/ljmatan/obfuscator/tree/main/output
 - **Generated code**: code generators (e.g., `build_runner`) may expect specific identifiers. Avoid renaming generated output unless you control the generator or also regenerate outputs appropriately.
 - **Third-party packages**: External packages referenced by name must remain consistent in `pubspec.yaml`; the tool tries to infer package dependencies by import, but manual verification is recommended.
 - **Edge cases in resolution**: some dynamic dispatch or runtime symbol lookups may not be detectable via static analysis; test thoroughly.
-  Fields accessed on `dynamic` receivers keep their original names, but `Symbol` literals, `runtimeType.toString()`
-  comparisons (class names are obfuscated), and constructor tear-offs assigned to function types with named parameters
-  are not handled.
+  Fields accessed on `dynamic` receivers, and fields named like the named parameters of function types (e.g., for
+  constructor tear-offs) keep their original names, but `Symbol` literals and `runtimeType.toString()` comparisons
+  (class names are obfuscated) are not handled.
+- **Language versions**: the tool is built on the analyzer 8 package, which doesn't support the syntax introduced by
+  Dart 3.12 and newer (e.g., private named parameters).
 - **Merged output**: the merged file is a single library. Clashing top-level names, private members and import
   prefixes are renamed, and extension member invocations which could resolve differently are made explicit.
   Library-level annotations, conditional imports of first-party libraries, and extension operators, cascaded
