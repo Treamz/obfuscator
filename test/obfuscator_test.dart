@@ -126,7 +126,7 @@ void main() {
     });
 
     test('renames classes and fields', () {
-      for (final name in ['Circle', 'Square', 'Counter', 'Point', 'Tagged', 'tagValue', 'otherField', 'Unused', 'unusedField']) {
+      for (final name in ['Circle', 'Square', 'Counter', 'Point', 'Tagged', 'tagValue', 'otherField', 'Unused', 'unusedField', 'total']) {
         expect(copied, isNot(_containsWord(name)), reason: name);
       }
       // Fields overriding each other without the annotation share the new name.
@@ -198,18 +198,34 @@ void main() {
       expect(merged, isNot(contains('library ')));
       expect(merged, isNot(contains('export ')));
       expect(merged, isNot(contains('part ')));
-      expect(merged, isNot(contains('h.')));
+      expect(merged, isNot(matches(RegExp(r'\bh\.'))));
     });
 
     test('generates a valid pubspec.yaml file', () {
       final pubspec = File(path.join(output, 'pubspec.yaml')).readAsStringSync();
-      expect(pubspec, contains('sdk: ^3.10.0'));
+      expect(pubspec, contains('sdk: ">=3.10.0 <4.0.0"'));
       expect(pubspec, isNot(contains('flutter:\n    sdk: flutter')));
       expect(pubspec, contains('dependency_overrides:'));
       expect(pubspec, contains(path.join(_temp.path, 'src', 'deps', 'localdep')));
       expect(pubspec, contains('path: assets/dir/'));
       expect(File(path.join(output, 'assets', 'data.txt')).existsSync(), isTrue);
       expect(File(path.join(output, 'assets', 'dir', 'nested.txt')).existsSync(), isTrue);
+    });
+
+    test('imports the third-party libraries re-exported by merged libraries', () {
+      expect(merged, contains("import 'dart:collection' show Queue, SplayTreeMap;"));
+      expect(merged, contains("import 'dart:collection' as ui show Queue, SplayTreeMap;"));
+    });
+
+    test('renames top-level declarations clashing with import prefixes', () {
+      expect(merged, contains('math_1'));
+    });
+
+    test('updates references of nested packages', () async {
+      final example = path.join(copy, 'example');
+      expect(await _errors(example), isEmpty);
+      expect(await _runDart(example, 'lib/main.dart'), await _runDart(path.join(source, 'example'), 'lib/main.dart'));
+      expect(File(path.join(example, 'lib', 'main.dart')).readAsStringSync(), isNot(_containsWord('Model')));
     });
   });
 
@@ -299,6 +315,52 @@ void main() {
       expect(Directory(path.join(copy, 'build')).existsSync(), isFalse);
       expect(Link(path.join(copy, 'loop')).targetSync(), '.');
       expect(Link(path.join(copy, 'outside')).targetSync(), Directory(path.dirname(root)).resolveSymbolicLinksSync());
+    });
+
+    test('generates an SDK constraint compatible with Dart 3 for legacy lower bounds', () async {
+      final package = await _prepareFixture('multi', name: 'legacy');
+      final root = path.join(package, 'one', 'shared');
+      final pubspec = File(path.join(root, 'pubspec.yaml'));
+      pubspec.writeAsStringSync(pubspec.readAsStringSync().replaceFirst('sdk: ^3.10.0', "sdk: '>=2.19.0 <4.0.0'"));
+      final output = path.join(_temp.path, 'out_legacy');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(File(path.join(output, 'pubspec.yaml')).readAsStringSync(), contains('sdk: ">=2.19.0 <4.0.0"'));
+      expect('${result.stdout}', isNot(contains('could not be resolved')));
+    });
+
+    test('never writes assets outside of the output directory', () async {
+      final package = await _prepareFixture('multi', name: 'assets');
+      final root = path.join(package, 'one', 'shared');
+      File(path.join(package, 'one', 'shared_asset.txt')).writeAsStringSync('shared');
+      final pubspec = File(path.join(root, 'pubspec.yaml'));
+      pubspec.writeAsStringSync('${pubspec.readAsStringSync()}flutter:\n  assets:\n    - ../shared_asset.txt\n');
+      final output = Directory(path.join(_temp.path, 'assets_out', 'out'));
+      final result = await _obfuscate(['--src=$root', '--out=${output.path}']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(File(path.join(output.parent.path, 'shared_asset.txt')).existsSync(), isFalse);
+      expect(File(path.join(output.path, 'pubspec.yaml')).readAsStringSync(), isNot(contains('shared_asset')));
+      expect(result.stdout, contains('asset "../shared_asset.txt" of the shared_one package is placed outside of the package'));
+    });
+
+    test('reports conflicting dependency declarations', () async {
+      final root = Directory(path.join(_temp.path, 'conflict'));
+      for (final name in ['dep_one', 'dep_two']) {
+        final directory = Directory(path.join(root.path, name, 'lib'))..createSync(recursive: true);
+        File(path.join(directory.parent.path, 'pubspec.yaml')).writeAsStringSync('name: dep\nenvironment:\n  sdk: ^3.10.0\n');
+        File(path.join(directory.path, 'dep.dart')).writeAsStringSync('int value = 1;\n');
+      }
+      for (final (name, dependency) in [('app_one', 'dep_one'), ('app_two', 'dep_two')]) {
+        final directory = Directory(path.join(root.path, name, 'lib'))..createSync(recursive: true);
+        File(path.join(directory.parent.path, 'pubspec.yaml')).writeAsStringSync(
+          'name: $name\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n  dep:\n    path: ../$dependency\n',
+        );
+        File(path.join(directory.path, '$name.dart')).writeAsStringSync('class ${name == 'app_one' ? 'One' : 'Two'} {}\n');
+      }
+      final output = path.join(_temp.path, 'out_conflict');
+      final result = await _obfuscate(['--src=${path.join(root.path, 'app_one')},${path.join(root.path, 'app_two')}', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(result.stdout, contains('conflicting declarations of the "dep" dependency'));
     });
 
     test('reports missing arguments without a stack trace', () async {

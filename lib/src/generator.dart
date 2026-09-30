@@ -185,11 +185,12 @@ class Generator {
     for (final entry in fileEdits.entries) {
       final file = dart_io.File(entry.key);
       var contents = await file.readAsString();
-      final edits = entry.value..sort((a, b) => b.offset.compareTo(a.offset));
-      var previousOffset = contents.length + 1;
+      final edits = entry.value..sort((a, b) => a.offset.compareTo(b.offset));
+      final buffer = StringBuffer();
+      var position = 0, previousOffset = -1;
       for (final edit in edits) {
-        // Edits are applied from the end of the file, so that the offsets remain valid.
-        if (edit.offset + edit.length > previousOffset || (edit.offset == previousOffset && edit.length == 0)) {
+        // Edits are applied in a single pass, in the order of their offsets, and must not overlap.
+        if (edit.offset < position || edit.offset == previousOffset) {
           throw StateError('Overlapping replacements in ${file.path} at offset ${edit.offset}.');
         }
         if (edit.length > 0 && contents.substring(edit.offset, edit.offset + edit.length) != edit.symbol.name) {
@@ -197,9 +198,14 @@ class Generator {
             'Unexpected source contents in ${file.path} at offset ${edit.offset}, expected "${edit.symbol.name}".',
           );
         }
-        contents = contents.replaceRange(edit.offset, edit.offset + edit.length, edit.text);
+        buffer
+          ..write(contents.substring(position, edit.offset))
+          ..write(edit.text);
+        position = edit.offset + edit.length;
         previousOffset = edit.offset;
       }
+      buffer.write(contents.substring(position));
+      contents = buffer.toString();
       await file.writeAsString(contents);
       print('Obfuscated ${edits.length} identifier(s) in ${file.path}.');
     }

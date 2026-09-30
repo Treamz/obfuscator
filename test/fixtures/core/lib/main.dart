@@ -2,6 +2,7 @@ import 'package:core/api.dart';
 import 'package:core/callbacks.dart';
 import 'package:core/core_types.dart';
 import 'package:core/freezed_like.dart';
+import 'package:core/inherited.dart';
 import 'package:core/misc.dart';
 import 'package:core/overrides.dart';
 import 'package:core/patterns.dart';
@@ -18,6 +19,7 @@ void main() {
     ...callbacksReport(),
     ...coreTypesReport(),
     ...freezedLikeReport(),
+    ...inheritedReport(),
     ...miscReport(),
     ...overridesReport(),
     ...patternsReport(),

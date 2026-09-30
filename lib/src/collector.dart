@@ -119,13 +119,14 @@ class ObfuscatedSymbol {
   ///
   final occurrences = <ObjectOccurrence>[];
 
+  /// File paths and offsets of the recorded [occurrences].
+  ///
+  final _occurrenceKeys = <(String, int)>{};
+
   /// Records an occurrence, ignoring any duplicate entries.
   ///
   void addOccurrence(ObjectOccurrence occurrence) {
-    if (occurrences.any((recorded) => recorded.filePath == occurrence.filePath && recorded.offset == occurrence.offset)) {
-      return;
-    }
-    occurrences.add(occurrence);
+    if (_occurrenceKeys.add((occurrence.filePath, occurrence.offset))) occurrences.add(occurrence);
   }
 }
 
@@ -297,24 +298,31 @@ class ObjectCollector {
     return result;
   }
 
-  /// Lists the Dart files of the [package], excluding hidden directories and nested packages.
+  /// Lists the Dart files of the copied [package], including its nested packages, excluding hidden directories.
   ///
   static List<String> listDartFiles(SourcePackage package) {
     final files = <String>[];
-    void visit(dart_io.Directory directory, {required bool isRoot}) {
-      if (!isRoot && dart_io.File(path.join(directory.path, 'pubspec.yaml')).existsSync()) return;
+    void visit(dart_io.Directory directory) {
       for (final entity in directory.listSync(followLinks: false)) {
         if (path.basename(entity.path).startsWith('.')) continue;
         if (entity is dart_io.Directory) {
-          visit(entity, isRoot: false);
+          visit(entity);
         } else if (entity is dart_io.File && entity.path.endsWith('.dart')) {
           files.add(entity.path);
         }
       }
     }
 
-    visit(package.copyDirectory, isRoot: true);
+    visit(package.copyDirectory);
     return files..sort();
+  }
+
+  /// Whether the [filePath] belongs to the `lib` directory of the copied [package] itself,
+  /// rather than to another directory or to a nested package.
+  ///
+  static bool isLibraryFile(SourcePackage package, String filePath) {
+    return path.isWithin(path.join(package.copyDirectory.path, 'lib'), filePath) &&
+        !package.nestedPackageDirectories.any((directory) => path.isWithin(directory, filePath));
   }
 
   /// Collect and store source code information.
@@ -322,7 +330,6 @@ class ObjectCollector {
   Future<void> _collectSources() async {
     final errors = <String>[];
     for (final package in _configuration.packages) {
-      final libPath = path.join(package.copyDirectory.path, 'lib');
       for (final filePath in listDartFiles(package)) {
         final result = await contextFor(_configuration.analysisContextCollection, filePath).currentSession.getResolvedUnit(filePath);
         if (result is! analyzer_results.ResolvedUnitResult) {
@@ -339,7 +346,7 @@ class ObjectCollector {
             file: dart_io.File(filePath),
             resolvedUnitResult: result,
             package: package,
-            isDeclarable: path.isWithin(libPath, filePath),
+            isDeclarable: isLibraryFile(package, filePath),
           ),
         );
         analyzer_token.Token? token = result.unit.beginToken;
@@ -377,15 +384,6 @@ class ObjectCollector {
     return declarations;
   }
 
-  /// Whether the [element] declares an instance member named [name].
-  ///
-  static bool _declaresInstanceMember(analyzer_element.InterfaceElement element, String name) {
-    return element.fields.any((field) => !field.isSynthetic && !field.isStatic && field.name == name) ||
-        element.getters.any((getter) => !getter.isSynthetic && !getter.isStatic && getter.name == name) ||
-        element.setters.any((setter) => !setter.isSynthetic && !setter.isStatic && setter.name == name) ||
-        element.methods.any((method) => !method.isStatic && method.name == name);
-  }
-
   /// Names and static modifiers of the members declared by the [element].
   ///
   static Iterable<({String name, bool isStatic})> _declaredMembers(analyzer_element.InterfaceElement element) sync* {
@@ -405,20 +403,42 @@ class ObjectCollector {
   void _selectSymbols(_Declarations declarations) {
     final families = _UnionFind();
     final nonRenamableMembers = <String>{};
+    void addMember(analyzer_element.InterfaceElement element, String name) {
+      final key = memberKey(element, name);
+      families.add(key);
+      if (!declarations.fields.containsKey(key)) nonRenamableMembers.add(key);
+    }
+
     for (final element in declarations.interfaces) {
       for (final member in _declaredMembers(element)) {
-        final key = memberKey(element, member.name);
-        families.add(key);
-        if (!declarations.fields.containsKey(key)) nonRenamableMembers.add(key);
-        if (member.isStatic) continue;
-        for (final supertype in element.allSupertypes) {
-          final superElement = supertype.element;
-          final isPrivate = member.name.startsWith('_');
-          if (isPrivate && superElement.library.uri != element.library.uri) continue;
-          if (!_declaresInstanceMember(superElement, member.name)) continue;
-          final superKey = memberKey(superElement, member.name);
-          families.union(key, superKey);
-          if (!declarations.fields.containsKey(superKey)) nonRenamableMembers.add(superKey);
+        addMember(element, member.name);
+      }
+      // Instance members with the same name, declared by the class or any of its supertypes, are related.
+      // This includes the members inherited from one supertype, implementing the members of another one.
+      final declarersByName = <String, List<analyzer_element.InterfaceElement>>{};
+      for (final declarer in [element, for (final supertype in element.allSupertypes) supertype.element]) {
+        for (final member in _declaredMembers(declarer)) {
+          if (member.isStatic) continue;
+          final declarers = declarersByName.putIfAbsent(member.name, () => []);
+          if (!declarers.contains(declarer)) declarers.add(declarer);
+        }
+      }
+      for (final entry in declarersByName.entries) {
+        // Private members are only related to the members declared in the same library.
+        final groups = entry.key.startsWith('_')
+            ? [
+                for (final uri in {for (final declarer in entry.value) declarer.library.uri})
+                  [
+                    for (final declarer in entry.value)
+                      if (declarer.library.uri == uri) declarer,
+                  ],
+              ]
+            : [entry.value];
+        for (final group in groups) {
+          for (final declarer in group) {
+            addMember(declarer, entry.key);
+            families.union(memberKey(group.first, entry.key), memberKey(declarer, entry.key));
+          }
         }
       }
     }

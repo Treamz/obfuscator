@@ -1,4 +1,6 @@
+import 'dart:convert' as dart_convert;
 import 'dart:io' as dart_io;
+import 'dart:math' as dart_math;
 
 import 'package:analyzer/dart/analysis/analysis_context_collection.dart' as analyzer_context;
 import 'package:analyzer/dart/analysis/results.dart' as analyzer_results;
@@ -30,13 +32,9 @@ class _MergedSource {
 
   /// Text replacements applied to the file contents before merging.
   ///
-  final edits = <({int offset, int end, String text})>[];
+  final edits = <({int offset, int end, String text})>{};
 
-  void addEdit(int offset, int end, String text) {
-    if (!edits.any((edit) => edit.offset == offset && edit.end == end && edit.text == text)) {
-      edits.add((offset: offset, end: end, text: text));
-    }
-  }
+  void addEdit(int offset, int end, String text) => edits.add((offset: offset, end: end, text: text));
 }
 
 /// Reference to a top-level declaration, which may require renaming or a prefix in the merged file.
@@ -116,9 +114,8 @@ class ProjectMerger {
   Future<List<_MergedSource>> _resolveSources(analyzer_context.AnalysisContextCollection collection) async {
     final sources = <_MergedSource>[];
     for (final package in _configuration.packages) {
-      final libPath = path.join(package.copyDirectory.path, 'lib');
       for (final filePath in ObjectCollector.listDartFiles(package)) {
-        if (!path.isWithin(libPath, filePath)) continue;
+        if (!ObjectCollector.isLibraryFile(package, filePath)) continue;
         final context = ObjectCollector.contextFor(collection, filePath);
         final result = await context.currentSession.getResolvedUnit(filePath);
         if (result is! analyzer_results.ResolvedUnitResult) {
@@ -141,11 +138,26 @@ class ProjectMerger {
       for (final directive in source.result.unit.directives) {
         if (directive is analyzer_ast.ImportDirective) {
           final importedLibrary = directive.libraryImport?.importedLibrary;
+          final prefix = directive.prefix?.name;
           if (!_isMergedLibrary(importedLibrary)) {
             final import = directive.toSource();
             if (!imports.contains(import)) imports.add(import);
+            if (prefix != null) _keptPrefixes.add(prefix);
             if (importedLibrary == null) {
               print('Warning: unresolved import "${directive.uri.stringValue}" in ${source.filePath}.');
+            }
+          } else {
+            // Third-party libraries re-exported by the merged library are imported directly, with the same
+            // prefix and combinators. Deferred loading is dropped, as the merged library is always loaded.
+            for (final export in _externalExports(importedLibrary!)) {
+              final import = [
+                "import '${export.library.uri}'",
+                if (prefix != null) 'as $prefix',
+                ...export.combinators,
+                for (final combinator in directive.combinators) combinator.toSource(),
+              ].join(' ');
+              if (!imports.contains('$import;')) imports.add('$import;');
+              if (prefix != null) _keptPrefixes.add(prefix);
             }
           }
         }
@@ -162,6 +174,42 @@ class ProjectMerger {
     return references;
   }
 
+  /// Prefixes of the imports included with the merged file.
+  ///
+  final _keptPrefixes = <String>{};
+
+  /// Third-party libraries exported by the merged [library], directly or through other merged libraries,
+  /// along with the combinators applied to them, in the order of application.
+  ///
+  List<({analyzer_element.LibraryElement library, List<String> combinators})> _externalExports(
+    analyzer_element.LibraryElement library, [
+    Set<Uri>? visited,
+  ]) {
+    visited ??= {library.uri};
+    final result = <({analyzer_element.LibraryElement library, List<String> combinators})>[];
+    for (final fragment in library.fragments) {
+      for (final export in fragment.libraryExports) {
+        final exportedLibrary = export.exportedLibrary;
+        if (exportedLibrary == null) continue;
+        final combinators = [
+          for (final combinator in export.combinators)
+            switch (combinator) {
+              analyzer_element.ShowElementCombinator(:final shownNames) => 'show ${shownNames.join(', ')}',
+              analyzer_element.HideElementCombinator(:final hiddenNames) => 'hide ${hiddenNames.join(', ')}',
+            },
+        ];
+        if (!_isMergedLibrary(exportedLibrary)) {
+          result.add((library: exportedLibrary, combinators: combinators));
+        } else if (visited.add(exportedLibrary.uri)) {
+          for (final nested in _externalExports(exportedLibrary, visited)) {
+            result.add((library: nested.library, combinators: [...nested.combinators, ...combinators]));
+          }
+        }
+      }
+    }
+    return result;
+  }
+
   /// Returns the end of a comment following the [offset] on the same line, or the [offset] itself.
   ///
   static int _endOfTrailingComment(String contents, int offset) {
@@ -173,7 +221,8 @@ class ProjectMerger {
   /// Finds the top-level names which would clash once the libraries are merged, and renames them.
   ///
   /// First-party top-level declarations are renamed if the same name is declared by multiple
-  /// libraries, or if the name refers to a different, third-party declaration in any of the libraries.
+  /// libraries, if the name refers to a different, third-party declaration in any of the libraries,
+  /// or if the name is used as an import prefix.
   /// Third-party references with ambiguous names are prefixed with a dedicated import.
   ///
   void _resolveNameClashes(
@@ -204,7 +253,9 @@ class ProjectMerger {
     final declaredNames = <String>{};
     for (final entry in declarations.entries) {
       final name = entry.value.name!;
-      if (declaredNames.add(name) && !externalReferencesByName.containsKey(name)) continue;
+      if (declaredNames.add(name) && !externalReferencesByName.containsKey(name) && !_keptPrefixes.contains(name)) {
+        continue;
+      }
       var index = 1;
       var newName = '${name}_$index';
       while (usedNames.contains(newName)) {
@@ -259,8 +310,15 @@ class ProjectMerger {
     for (final import in libraryFragment.libraryImports) {
       if (import.prefix != null) continue;
       final importedElement = import.namespace.get2(element.name!);
-      if (_topLevelElement(importedElement) == element.baseElement) {
-        return import.importedLibrary?.uri.toString();
+      if (_topLevelElement(importedElement) != element.baseElement) continue;
+      final importedLibrary = import.importedLibrary;
+      if (importedLibrary == null) continue;
+      if (!_isMergedLibrary(importedLibrary)) return importedLibrary.uri.toString();
+      // The element is re-exported by a merged library, it's imported from the exporting third-party library.
+      for (final export in _externalExports(importedLibrary)) {
+        if (_topLevelElement(export.library.exportNamespace.get2(element.name!)) == element.baseElement) {
+          return export.library.uri.toString();
+        }
       }
     }
     return null;
@@ -291,17 +349,22 @@ class ProjectMerger {
   /// Applies the recorded edits to the [source] contents.
   ///
   static String _applyEdits(_MergedSource source) {
-    var contents = source.result.content;
-    final edits = [...source.edits]..sort((a, b) => b.offset != a.offset ? b.offset.compareTo(a.offset) : b.end.compareTo(a.end));
-    var previousOffset = contents.length;
+    final contents = source.result.content;
+    final edits = [...source.edits]..sort((a, b) => a.offset != b.offset ? a.offset.compareTo(b.offset) : a.end.compareTo(b.end));
+    final buffer = StringBuffer();
+    var position = 0;
     for (final edit in edits) {
-      if (edit.end > previousOffset) {
+      // Edits are applied in a single pass, in the order of their offsets, and must not overlap.
+      if (edit.offset < position) {
         throw StateError('Overlapping merge edits in ${source.filePath} at offset ${edit.offset}.');
       }
-      contents = contents.replaceRange(edit.offset, edit.end, edit.text);
-      previousOffset = edit.offset;
+      buffer
+        ..write(contents.substring(position, edit.offset))
+        ..write(edit.text);
+      position = edit.end;
     }
-    return contents.trim();
+    buffer.write(contents.substring(position));
+    return buffer.toString().trim();
   }
 
   /// Converts a [dependency] declared by the [package] to a `pubspec.yaml` value.
@@ -323,7 +386,7 @@ class ProjectMerger {
               },
       pubspec_parse.PathDependency(path: final dependencyPath) => {
         'path': _configuration.resolveDependencyPath(
-          package: package,
+          baseDirectory: package.sourceDirectory.path,
           dependencyPath: dependencyPath,
           preferCopies: false,
         ),
@@ -342,9 +405,9 @@ class ProjectMerger {
     };
   }
 
-  /// Returns the highest lower bound of the [constraints], formatted as a caret constraint.
+  /// Returns the highest lower bound of the [constraints], or `null` if none of them has a lower bound.
   ///
-  static String? _mergeVersionConstraints(Iterable<pub_semver.VersionConstraint?> constraints) {
+  static pub_semver.Version? _highestLowerBound(Iterable<pub_semver.VersionConstraint?> constraints) {
     pub_semver.Version? minimum;
     for (final constraint in constraints) {
       if (constraint is pub_semver.VersionRange) {
@@ -352,14 +415,21 @@ class ProjectMerger {
         if (min != null && (minimum == null || min > minimum)) minimum = min;
       }
     }
-    return minimum == null ? null : '^$minimum';
+    return minimum;
   }
 
   /// Copies an asset (file or directory) declared by the [package] to the output directory.
   ///
-  void _copyAsset(SourcePackage package, String assetPath) {
+  /// Returns `false` if the asset can't be included with the merged project.
+  ///
+  bool _copyAsset(SourcePackage package, String assetPath) {
     final sourcePath = path.join(package.sourceDirectory.path, assetPath);
-    final destinationPath = path.join(_configuration.outputDirectory.path, assetPath);
+    final outputPath = _configuration.outputDirectory.path;
+    final destinationPath = path.normalize(path.join(outputPath, assetPath));
+    if (!path.isWithin(outputPath, destinationPath)) {
+      print('Warning: asset "$assetPath" of the ${package.name} package is placed outside of the package, it is not included.');
+      return false;
+    }
     final type = dart_io.FileSystemEntity.typeSync(sourcePath);
     if (type == dart_io.FileSystemEntityType.file) {
       dart_io.File(destinationPath).parent.createSync(recursive: true);
@@ -372,8 +442,10 @@ class ProjectMerger {
         entity.copySync(target);
       }
     } else {
-      print('Warning: asset "$assetPath" of the ${package.name} package was not found.');
+      print('Warning: asset "$assetPath" of the ${package.name} package was not found, it is not included.');
+      return false;
     }
+    return true;
   }
 
   /// Merges the `flutter` sections of the source packages, copying the declared assets and fonts.
@@ -394,20 +466,21 @@ class ProjectMerger {
       if (packageAssets is List) {
         for (final asset in packageAssets) {
           final assetPath = asset is Map ? asset['path'] : asset;
-          if (assetPath is String) _copyAsset(package, assetPath);
+          if (assetPath is! String || !_copyAsset(package, assetPath)) continue;
           if (!assets.any((existing) => existing.toString() == asset.toString())) assets.add(asset);
         }
       }
       final packageFonts = configuration['fonts'];
       if (packageFonts is List) {
         for (final family in packageFonts) {
-          fonts.add(family);
           final familyFonts = family is Map ? family['fonts'] : null;
           if (familyFonts is! List) continue;
+          var included = true;
           for (final font in familyFonts) {
             final asset = font is Map ? font['asset'] : null;
-            if (asset is String) _copyAsset(package, asset);
+            if (asset is! String || !_copyAsset(package, asset)) included = false;
           }
+          if (included) fonts.add(family);
         }
       }
     }
@@ -426,17 +499,35 @@ class ProjectMerger {
       for (final package in packages) {
         for (final entry in section(package.pubspec).entries) {
           if (sourcePackageNames.contains(entry.key)) continue;
-          result[entry.key] = _dependencyToYamlNode(package, entry.value);
+          final node = _dependencyToYamlNode(package, entry.value);
+          final existing = result[entry.key];
+          if (!result.containsKey(entry.key)) {
+            result[entry.key] = node;
+          } else if (dart_convert.jsonEncode(existing) != dart_convert.jsonEncode(node)) {
+            // Hosted version constraints are intersected, other conflicting declarations are reported.
+            final intersection = existing is String && node is String
+                ? pub_semver.VersionConstraint.parse(existing).intersect(pub_semver.VersionConstraint.parse(node))
+                : null;
+            if (intersection != null && !intersection.isEmpty) {
+              result[entry.key] = intersection.toString();
+            } else {
+              print(
+                'Warning: conflicting declarations of the "${entry.key}" dependency (${dart_convert.jsonEncode(existing)} and '
+                '${dart_convert.jsonEncode(node)}), the first one is used.',
+              );
+            }
+          }
         }
       }
       return result;
     }
 
+    final sdkMinimum = _highestLowerBound(packages.map((package) => package.pubspec.environment['sdk']));
     final environment = <String, Object?>{
-      'sdk': _mergeVersionConstraints(packages.map((package) => package.pubspec.environment['sdk'])) ?? '^3.0.0',
+      'sdk': sdkMinimum == null ? '^3.0.0' : '>=$sdkMinimum <${dart_math.max(4, sdkMinimum.major + 1)}.0.0',
     };
-    final flutterConstraint = _mergeVersionConstraints(packages.map((package) => package.pubspec.environment['flutter']));
-    if (flutterConstraint != null) environment['flutter'] = flutterConstraint;
+    final flutterMinimum = _highestLowerBound(packages.map((package) => package.pubspec.environment['flutter']));
+    if (flutterMinimum != null) environment['flutter'] = '>=$flutterMinimum';
     final dependencies = mergeDependencies((pubspec) => pubspec.dependencies);
     final devDependencies = mergeDependencies((pubspec) => pubspec.devDependencies);
     final dependencyOverrides = mergeDependencies((pubspec) => pubspec.dependencyOverrides);

@@ -45,13 +45,23 @@ class SourcePackage {
   ///
   late dart_io.Directory copyDirectory;
 
+  /// Locations of the packages nested within the [copyDirectory] (e.g., `example`).
+  ///
+  /// Their declarations are not obfuscated, but their references to the obfuscated declarations are updated.
+  ///
+  final nestedPackageDirectories = <String>[];
+
   /// Package identifier, as defined with the `pubspec.yaml` file.
   ///
   String get name => pubspec.name;
 
   /// Whether the package requires the Flutter SDK for dependency resolution.
   ///
-  bool get usesFlutter => [
+  bool get usesFlutter => usesFlutterSdk(pubspec);
+
+  /// Whether the package described by the [pubspec] requires the Flutter SDK for dependency resolution.
+  ///
+  static bool usesFlutterSdk(pubspec_parse.Pubspec pubspec) => [
     ...pubspec.dependencies.values,
     ...pubspec.devDependencies.values,
     ...pubspec.dependencyOverrides.values,
@@ -357,13 +367,17 @@ class Configuration {
     }
   }
 
-  /// Adjusts the copied `pubspec.yaml` file of the [package] so that it resolves from the copy location.
+  /// Adjusts a copied `pubspec.yaml` file so that it resolves from the [copyDirectory] location.
   ///
-  /// The `resolution: workspace` entry is removed, and relative path dependencies are converted
-  /// to absolute ones, or to the copy locations for the packages which are obfuscated as well.
+  /// The `resolution: workspace` entry is removed, and relative path dependencies, declared relative to
+  /// the [originalDirectory], are converted to absolute ones, or to the copy locations for the packages
+  /// which are obfuscated as well.
   ///
-  void _updateCopiedPubspec(SourcePackage package) {
-    final pubspecFile = dart_io.File(path.join(package.copyDirectory.path, 'pubspec.yaml'));
+  void _updateCopiedPubspec({
+    required String copyDirectory,
+    required String originalDirectory,
+  }) {
+    final pubspecFile = dart_io.File(path.join(copyDirectory, 'pubspec.yaml'));
     final editor = yaml_edit.YamlEditor(pubspecFile.readAsStringSync());
     final contents = editor.parseAt([]).value;
     if (contents is! Map) return;
@@ -379,7 +393,7 @@ class Configuration {
         editor.update(
           [section, entry.key, 'path'],
           resolveDependencyPath(
-            package: package,
+            baseDirectory: originalDirectory,
             dependencyPath: dependency['path'] as String,
             preferCopies: true,
           ),
@@ -389,17 +403,18 @@ class Configuration {
     pubspecFile.writeAsStringSync(editor.toString());
   }
 
-  /// Returns the absolute location of a path dependency declared by [package] as [dependencyPath].
+  /// Returns the absolute location of a path dependency declared as [dependencyPath] by the package
+  /// placed in the [baseDirectory].
   ///
   /// If the dependency is one of the obfuscated packages and [preferCopies] is `true`,
   /// the location of its copy is returned instead.
   ///
   String resolveDependencyPath({
-    required SourcePackage package,
+    required String baseDirectory,
     required String dependencyPath,
     required bool preferCopies,
   }) {
-    final absolutePath = _resolvePath(path.join(package.sourceDirectory.path, dependencyPath));
+    final absolutePath = _resolvePath(path.join(baseDirectory, dependencyPath));
     if (preferCopies) {
       for (final other in packages) {
         if (path.equals(other.sourceDirectory.path, absolutePath)) return other.copyDirectory.path;
@@ -417,7 +432,7 @@ class Configuration {
     required bool flutter,
   }) async {
     final executable = flutter ? 'flutter' : 'dart';
-    var lastError = '';
+    final errors = <String>[];
     for (final extraArguments in const [
       <String>[],
       <String>['--offline'],
@@ -434,9 +449,12 @@ class Configuration {
         throw ConfigurationException('Unable to run "$executable pub get" in ${directory.path}: ${e.message}');
       }
       if (result.exitCode == 0) return;
-      lastError = '${result.stdout}\n${result.stderr}'.trim();
+      errors.add('${result.stdout}\n${result.stderr}'.trim());
     }
-    throw ConfigurationException('"$executable pub get" failed in ${directory.path}:\n$lastError');
+    throw ConfigurationException(
+      '"$executable pub get" failed in ${directory.path}:\n${errors.first}\n\n'
+      'Retrying with "--offline" failed as well:\n${errors.last}',
+    );
   }
 
   /// Define locations and copy source code directories to the newly-created `copy` folder.
@@ -463,13 +481,55 @@ class Configuration {
         sourceRoot: package.sourceDirectory.path,
         isRoot: true,
       );
-      _updateCopiedPubspec(package);
+      _updateCopiedPubspec(
+        copyDirectory: package.copyDirectory.path,
+        originalDirectory: package.sourceDirectory.path,
+      );
+      _findNestedPackages(package, package.copyDirectory);
+      for (final nestedDirectory in package.nestedPackageDirectories) {
+        _updateCopiedPubspec(
+          copyDirectory: nestedDirectory,
+          originalDirectory: path.join(
+            package.sourceDirectory.path,
+            path.relative(nestedDirectory, from: package.copyDirectory.path),
+          ),
+        );
+      }
     }
     for (final package in packages) {
       await runPubGet(
         directory: package.copyDirectory,
         flutter: package.usesFlutter,
       );
+    }
+    for (final package in packages) {
+      for (final nestedDirectory in package.nestedPackageDirectories) {
+        try {
+          final nestedPubspec = pubspec_parse.Pubspec.parse(
+            dart_io.File(path.join(nestedDirectory, 'pubspec.yaml')).readAsStringSync(),
+          );
+          await runPubGet(
+            directory: dart_io.Directory(nestedDirectory),
+            flutter: SourcePackage.usesFlutterSdk(nestedPubspec),
+          );
+        } catch (e) {
+          print(
+            'Warning: references of the nested package $nestedDirectory may not be updated, as its dependencies could not be resolved:\n$e',
+          );
+        }
+      }
+    }
+  }
+
+  /// Records the packages nested within the [directory] of the copied [package].
+  ///
+  void _findNestedPackages(SourcePackage package, dart_io.Directory directory) {
+    for (final entity in directory.listSync(followLinks: false)) {
+      if (entity is! dart_io.Directory || path.basename(entity.path).startsWith('.')) continue;
+      if (dart_io.File(path.join(entity.path, 'pubspec.yaml')).existsSync()) {
+        package.nestedPackageDirectories.add(entity.path);
+      }
+      _findNestedPackages(package, entity);
     }
   }
 
