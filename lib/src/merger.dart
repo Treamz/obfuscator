@@ -32,9 +32,17 @@ class _MergedSource {
 
   /// Text replacements applied to the file contents before merging.
   ///
-  final edits = <({int offset, int end, String text})>{};
+  /// Edits at the same offset are applied by their `priority` (lower first), then in the order of addition.
+  ///
+  final edits = <({int offset, int end, String text, int priority, int order})>[];
 
-  void addEdit(int offset, int end, String text) => edits.add((offset: offset, end: end, text: text));
+  final _editKeys = <(int, int, String)>{};
+
+  void addEdit(int offset, int end, String text, {int priority = 1}) {
+    if (_editKeys.add((offset, end, text))) {
+      edits.add((offset: offset, end: end, text: text, priority: priority, order: edits.length));
+    }
+  }
 }
 
 /// Third-party library exported by a merged library, with the combinators applied to it, in the order of application.
@@ -356,6 +364,94 @@ class ProjectMerger {
     return exports;
   }
 
+  /// New names of the top-level declarations renamed to avoid clashes, mapped by their keys.
+  ///
+  final _topLevelRenames = <String, String>{};
+
+  /// Unique identifier of an extension [element], including the unnamed ones.
+  ///
+  static String _extensionKey(analyzer_element.ExtensionElement element) {
+    return '${element.library.uri}#${element.name ?? ''}@${element.firstFragment.offset}';
+  }
+
+  /// Names of the instance members declared by an extension [element].
+  ///
+  static Set<String> _extensionMemberNames(analyzer_element.ExtensionElement element) {
+    return {
+      for (final member in <analyzer_element.ExecutableElement>[...element.methods, ...element.getters, ...element.setters])
+        if (!member.isStatic && member.name != null) member.name!,
+    };
+  }
+
+  /// Makes the extension member invocations explicit where more extensions become visible once merged.
+  ///
+  /// An extension declared by another merged library, or imported by another merged file, may be more specific
+  /// than the one an invocation originally resolved to, or make it ambiguous. Such invocations are rewritten to
+  /// explicit extension overrides (e.g., `OnObject(value).describe()`), naming the unnamed extensions if needed.
+  ///
+  void _resolveExtensionClashes(List<_MergedSource> sources, Set<String> usedNames) {
+    final visibleBySource = {
+      for (final source in sources)
+        source: {
+          for (final extension in source.result.libraryFragment.accessibleExtensions) _extensionKey(extension): extension,
+        },
+    };
+    final mergedScope = <String, analyzer_element.ExtensionElement>{
+      for (final visible in visibleBySource.values) ...visible,
+    };
+    final declarations = <String, (_MergedSource, analyzer_ast.ExtensionDeclaration)>{
+      for (final source in sources)
+        for (final declaration in source.result.unit.declarations.whereType<analyzer_ast.ExtensionDeclaration>())
+          if (declaration.declaredFragment?.element case final element?) _extensionKey(element): (source, declaration),
+    };
+    final overrideNames = <String, String?>{};
+
+    String? overrideName(_MergedSource source, analyzer_element.ExtensionElement extension) {
+      final key = _extensionKey(extension);
+      if (!_isMergedLibrary(extension.library)) {
+        // Third-party extensions can be named only if they are imported without a prefix.
+        final name = extension.name;
+        if (name == null) return null;
+        final isImported = source.result.libraryFragment.libraryImports.any((import) {
+          final imported = import.prefix == null ? import.namespace.get2(name) : null;
+          return imported is analyzer_element.ExtensionElement && _extensionKey(imported) == key;
+        });
+        return isImported ? name : null;
+      }
+      return overrideNames.putIfAbsent(key, () {
+        final name = extension.name;
+        if (name != null) return _topLevelRenames[_topLevelKey(extension)] ?? name;
+        final declaration = declarations[key];
+        if (declaration == null) return null;
+        var index = 0;
+        var newName = '_MergedExtension$index';
+        while (usedNames.contains(newName)) {
+          newName = '_MergedExtension${++index}';
+        }
+        usedNames.add(newName);
+        final keyword = declaration.$2.extensionKeyword;
+        declaration.$1.addEdit(keyword.end, keyword.end, ' $newName');
+        return newName;
+      });
+    }
+
+    for (final source in sources) {
+      final visible = visibleBySource[source]!;
+      final memberNames = {
+        for (final entry in mergedScope.entries)
+          if (!visible.containsKey(entry.key)) ..._extensionMemberNames(entry.value),
+      };
+      if (memberNames.isEmpty) continue;
+      source.result.unit.accept(
+        _ExtensionOverrideVisitor(
+          source: source,
+          memberNames: memberNames,
+          overrideName: (extension) => overrideName(source, extension),
+        ),
+      );
+    }
+  }
+
   /// Unique identifier of a private class or extension member an [element] reference resolves to,
   /// or `null` if the element isn't such a member.
   ///
@@ -522,7 +618,7 @@ class ProjectMerger {
           .add(reference);
     }
 
-    final renames = <String, String>{};
+    final renames = _topLevelRenames;
     final declaredNames = <String>{};
     for (final entry in declarations.entries) {
       final name = entry.value.name!;
@@ -633,7 +729,16 @@ class ProjectMerger {
   ///
   static String _applyEdits(_MergedSource source) {
     final contents = source.result.content;
-    final edits = [...source.edits]..sort((a, b) => a.offset != b.offset ? a.offset.compareTo(b.offset) : a.end.compareTo(b.end));
+    final edits = [...source.edits]
+      ..sort(
+        (a, b) => a.offset != b.offset
+            ? a.offset.compareTo(b.offset)
+            : a.priority != b.priority
+            ? a.priority.compareTo(b.priority)
+            : a.end != b.end
+            ? a.end.compareTo(b.end)
+            : a.order.compareTo(b.order),
+      );
     final buffer = StringBuffer();
     var position = 0;
     for (final edit in edits) {
@@ -848,6 +953,7 @@ class ProjectMerger {
     final exportedNames = <String, analyzer_element.Element>{};
     final exports = _publicExports(sources, exportedNames);
     _resolveNameClashes(sources, references, imports, usedNames, exportedNames);
+    _resolveExtensionClashes(sources, usedNames);
     await collection.dispose();
 
     final fileBuffer = StringBuffer();
@@ -1080,5 +1186,137 @@ class _PrivateMemberVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
       }
     }
     super.visitPatternField(node);
+  }
+}
+
+/// Rewrites the implicit extension member invocations to explicit extension overrides,
+/// for the member names which become ambiguous once the libraries are merged.
+///
+class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
+  _ExtensionOverrideVisitor({
+    required this.source,
+    required this.memberNames,
+    required this.overrideName,
+  });
+
+  final _MergedSource source;
+
+  /// Names of the members of the extensions which become visible once merged.
+  ///
+  final Set<String> memberNames;
+
+  /// Returns the name used to explicitly apply an extension, or `null` if it can't be referenced.
+  ///
+  final String? Function(analyzer_element.ExtensionElement extension) overrideName;
+
+  /// Returns the extension declaring the instance member an [element] reference resolves to.
+  ///
+  static analyzer_element.ExtensionElement? _extensionOf(analyzer_element.Element? element) {
+    final base = element?.baseElement;
+    final enclosingElement = base?.enclosingElement;
+    if (base is! analyzer_element.ExecutableElement || base.isStatic) return null;
+    return enclosingElement is analyzer_element.ExtensionElement ? enclosingElement : null;
+  }
+
+  void _warn(analyzer_ast.AstNode node, String name) {
+    final location = source.result.lineInfo.getLocation(node.offset);
+    print(
+      'Warning: ${source.filePath}:${location.lineNumber}: the "$name" extension member may resolve '
+      'to a different extension in the merged file, and could not be made explicit.',
+    );
+  }
+
+  /// Applies the extension declaring the [element] explicitly to the [target] of an invocation.
+  ///
+  void _override({
+    required analyzer_ast.AstNode node,
+    required analyzer_element.Element? element,
+    required String name,
+    required analyzer_ast.Expression? target,
+    required bool isCascaded,
+  }) {
+    final extension = _extensionOf(element);
+    if (extension == null || !memberNames.contains(name) || target is analyzer_ast.ExtensionOverride) return;
+    // Members invoked on the implicit `this` are declared by the enclosing extension, resolved lexically.
+    if (target == null && !isCascaded) return;
+    final extensionName = overrideName(extension);
+    if (isCascaded || target is analyzer_ast.SuperExpression || extensionName == null) {
+      _warn(node, name);
+      return;
+    }
+    source.addEdit(target!.offset, target.offset, '$extensionName(', priority: 0);
+    source.addEdit(target.end, target.end, ')');
+  }
+
+  @override
+  void visitImportDirective(analyzer_ast.ImportDirective node) {}
+
+  @override
+  void visitExportDirective(analyzer_ast.ExportDirective node) {}
+
+  @override
+  void visitMethodInvocation(analyzer_ast.MethodInvocation node) {
+    _override(
+      node: node,
+      element: node.methodName.element,
+      name: node.methodName.name,
+      target: node.target,
+      isCascaded: node.isCascaded,
+    );
+    super.visitMethodInvocation(node);
+  }
+
+  @override
+  void visitPropertyAccess(analyzer_ast.PropertyAccess node) {
+    _override(
+      node: node,
+      element: node.propertyName.element ?? ObjectCollector.assignedElement(node.propertyName),
+      name: node.propertyName.name,
+      target: node.target,
+      isCascaded: node.isCascaded,
+    );
+    super.visitPropertyAccess(node);
+  }
+
+  @override
+  void visitPrefixedIdentifier(analyzer_ast.PrefixedIdentifier node) {
+    _override(
+      node: node,
+      element: node.identifier.element ?? ObjectCollector.assignedElement(node.identifier),
+      name: node.identifier.name,
+      target: node.prefix,
+      isCascaded: false,
+    );
+    super.visitPrefixedIdentifier(node);
+  }
+
+  void _checkOperator(analyzer_ast.AstNode node, analyzer_element.Element? element) {
+    final extension = _extensionOf(element);
+    final name = element?.name;
+    if (extension != null && name != null && memberNames.contains(name)) _warn(node, name);
+  }
+
+  @override
+  void visitBinaryExpression(analyzer_ast.BinaryExpression node) {
+    _checkOperator(node, node.element);
+    super.visitBinaryExpression(node);
+  }
+
+  @override
+  void visitIndexExpression(analyzer_ast.IndexExpression node) {
+    _checkOperator(node, node.element);
+    super.visitIndexExpression(node);
+  }
+
+  @override
+  void visitPrefixExpression(analyzer_ast.PrefixExpression node) {
+    _checkOperator(node, node.element);
+    super.visitPrefixExpression(node);
+  }
+
+  @override
+  void visitFunctionExpressionInvocation(analyzer_ast.FunctionExpressionInvocation node) {
+    _checkOperator(node, node.element);
+    super.visitFunctionExpressionInvocation(node);
   }
 }

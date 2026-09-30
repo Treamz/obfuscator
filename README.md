@@ -188,7 +188,8 @@ https://github.com/ljmatan/obfuscator/tree/main/output
    object patterns, combinators and documentation comments.
 6. **Replace**: The copied files are rewritten with the generated names, and the mappings are recorded.
 7. **Generate merged.dart**: The `lib` files are merged into a single library. Directives are removed,
-   first-party import prefixes are dropped, and clashing top-level names are renamed.
+   first-party import prefixes are dropped, clashing names are renamed, third-party exports of public
+   libraries are kept, and extension invocations affected by the merge are made explicit.
 8. **Generate pubspec.yaml**: The dependencies, SDK constraints and Flutter assets of the source packages are merged.
 
 ---
@@ -245,8 +246,10 @@ https://github.com/ljmatan/obfuscator/tree/main/output
 - **Edge cases in resolution**: some dynamic dispatch or runtime symbol lookups may not be detectable via static analysis; test thoroughly.
   This includes `dynamic` member access, `Symbol` literals, `runtimeType.toString()` comparisons, and constructor tear-offs
   assigned to function types with named parameters.
-- **Merged output**: the merged file is a single library, so library-level annotations, conditional imports of
-  first-party libraries, and multiple unnamed extensions with the same members may need manual adjustments.
+- **Merged output**: the merged file is a single library. Clashing top-level names, private members and import
+  prefixes are renamed, and extension member invocations which could resolve differently are made explicit.
+  Library-level annotations, conditional imports of first-party libraries, and extension operators or cascaded
+  extension invocations (reported with a warning) may need manual adjustments.
   The `flutter: generate: true` (localizations) setting is not supported.
 - **Legal**: ensure you have the right to obfuscate and distribute any source code; follow licenses and agreements.
 
