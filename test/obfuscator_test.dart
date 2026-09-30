@@ -206,6 +206,9 @@ void main() {
       expect(pubspec, contains('sdk: ">=3.10.0 <4.0.0"'));
       // A single merged package keeps its name, for the references to its own assets.
       expect(pubspec, contains('name: merge_app'));
+      expect(pubspec, contains('version: 2.3.4'));
+      // Development dependencies may depend on the merged package itself, and are not needed without tests.
+      expect(pubspec, isNot(contains('dev_dependencies')));
       expect(pubspec, isNot(contains('flutter:\n    sdk: flutter')));
       expect(pubspec, contains('dependency_overrides:'));
       expect(pubspec, contains(path.join(_temp.path, 'src', 'deps', 'localdep')));

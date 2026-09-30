@@ -487,6 +487,69 @@ class ProjectMerger {
     }
   }
 
+  /// New names of the private members renamed to avoid clashes, mapped by their keys.
+  ///
+  final _privateRenames = <String, String>{};
+
+  /// Name of a private member [name] of the [element] in the merged file.
+  ///
+  String _mergedMemberName(analyzer_element.InstanceElement element, String name) {
+    return _privateRenames['${element.library.uri}#$name'] ?? name;
+  }
+
+  /// Names of the instance members of the [element] in the merged file, only the concrete ones if [concrete].
+  ///
+  Iterable<String> _instanceMemberNames(analyzer_element.InterfaceElement element, {required bool concrete}) sync* {
+    for (final field in element.fields) {
+      if (!field.isStatic && !field.isSynthetic && !(concrete && field.isAbstract) && field.name != null) {
+        yield _mergedMemberName(element, field.name!);
+      }
+    }
+    for (final member in <analyzer_element.ExecutableElement>[...element.getters, ...element.setters, ...element.methods]) {
+      if (!member.isStatic && !member.isSynthetic && !(concrete && member.isAbstract) && member.name != null) {
+        yield _mergedMemberName(element, member.name!);
+      }
+    }
+  }
+
+  /// Adds `noSuchMethod` forwarders to the classes implementing private members of other merged libraries.
+  ///
+  /// A class doesn't have to implement the private members of an interface declared by another library,
+  /// as they can't be accessed, and invoking them throws a [NoSuchMethodError]. Once the libraries are merged,
+  /// such members must be implemented. Overriding `noSuchMethod` generates forwarders for them, which keep
+  /// throwing the [NoSuchMethodError].
+  ///
+  void _addPrivateMemberForwarders(List<_MergedSource> sources) {
+    for (final source in sources) {
+      for (final declaration in source.result.unit.declarations.whereType<analyzer_ast.ClassDeclaration>()) {
+        final element = declaration.declaredFragment?.element;
+        if (element == null || element.isAbstract) continue;
+        final required = <String>{
+          for (final supertype in element.allSupertypes)
+            if (_isMergedLibrary(supertype.element.library) && supertype.element.library.uri != element.library.uri)
+              for (final name in _instanceMemberNames(supertype.element, concrete: false))
+                if (name.startsWith('_')) name,
+        };
+        if (required.isEmpty) continue;
+        // Concrete members of the superclass chain (excluding `Object`) and of the applied mixins.
+        final concrete = <String>{};
+        for (var type = element.thisType; !type.isDartCoreObject; type = type.element.supertype!) {
+          for (final declarer in [type.element, for (final mixin in type.mixins) mixin.element]) {
+            concrete.addAll(_instanceMemberNames(declarer, concrete: true));
+          }
+          if (type.element.supertype == null) break;
+        }
+        // A custom `noSuchMethod` already generates the forwarders.
+        if (concrete.contains('noSuchMethod') || required.every(concrete.contains)) continue;
+        source.addEdit(
+          declaration.rightBracket.offset,
+          declaration.rightBracket.offset,
+          '\n  @override\n  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n',
+        );
+      }
+    }
+  }
+
   /// Renames the private members declared under the same names by multiple merged libraries.
   ///
   /// Private members of different libraries are unrelated, but once the libraries are merged, they would
@@ -503,7 +566,7 @@ class ProjectMerger {
         }
       }
     }
-    final renames = <String, String>{};
+    final renames = _privateRenames;
     for (final entry in librariesByName.entries) {
       for (final library in entry.value.skip(1)) {
         var index = 1;
@@ -927,12 +990,14 @@ class ProjectMerger {
     final flutterMinimum = _highestLowerBound(packages.map((package) => package.pubspec.environment['flutter']));
     if (flutterMinimum != null) environment['flutter'] = '>=$flutterMinimum';
     final dependencies = mergeDependencies((pubspec) => pubspec.dependencies);
-    final devDependencies = mergeDependencies((pubspec) => pubspec.devDependencies);
+    // Development dependencies are not included, as the merged package contains no tests or tools, and they may
+    // depend on the merged package itself (e.g., `test` on `args`), which would conflict with it.
     final dependencyOverrides = mergeDependencies((pubspec) => pubspec.dependencyOverrides);
     final flutter = _mergeFlutterConfiguration();
 
     // A single package keeps its name, so that references to its own assets (e.g., `package: 'name'`) remain valid.
     final name = packages.length == 1 ? packages.single.name : 'merged_app';
+    final version = packages.length == 1 ? packages.single.pubspec.version?.toString() ?? '1.0.0+1' : '1.0.0+1';
     if (packages.length > 1 && flutter != null) {
       print(
         'Warning: the assets of the merged packages are included with the "$name" package, '
@@ -943,11 +1008,10 @@ class ProjectMerger {
     editor.update([], {
       'name': name,
       'description': 'A new merged application.',
-      'version': '1.0.0+1',
+      'version': version,
       'publish_to': 'none',
       'environment': environment,
       if (dependencies.isNotEmpty) 'dependencies': dependencies,
-      if (devDependencies.isNotEmpty) 'dev_dependencies': devDependencies,
       if (dependencyOverrides.isNotEmpty) 'dependency_overrides': dependencyOverrides,
       'flutter': ?flutter,
     });
@@ -968,6 +1032,7 @@ class ProjectMerger {
     final usedNames = {..._collector.usedIdentifiers};
     _resolvePrefixClashes(imports, usedNames);
     _resolvePrivateMemberClashes(sources, usedNames);
+    _addPrivateMemberForwarders(sources);
     final exportedNames = <String, analyzer_element.Element>{};
     final exports = _publicExports(sources, exportedNames);
     _resolveNameClashes(sources, references, imports, usedNames, exportedNames);
