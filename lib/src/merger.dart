@@ -356,6 +356,76 @@ class ProjectMerger {
     return exports;
   }
 
+  /// Unique identifier of a private class or extension member an [element] reference resolves to,
+  /// or `null` if the element isn't such a member.
+  ///
+  static String? _privateMemberKey(analyzer_element.Element? element) {
+    var base = element?.baseElement;
+    if (base is analyzer_element.FieldFormalParameterElement) base = base.field;
+    if (base is analyzer_element.PropertyAccessorElement) base = base.variable;
+    if (base is! analyzer_element.FieldElement && base is! analyzer_element.MethodElement) return null;
+    final name = base!.name;
+    if (name == null || !name.startsWith('_') || base.enclosingElement is! analyzer_element.InstanceElement) return null;
+    return '${base.library!.uri}#$name';
+  }
+
+  /// Name tokens of the members declared by a class-like or extension [declaration].
+  ///
+  static Iterable<analyzer_token.Token> _memberNames(analyzer_ast.CompilationUnitMember declaration) sync* {
+    final members = switch (declaration) {
+      analyzer_ast.ClassDeclaration(:final members) ||
+      analyzer_ast.MixinDeclaration(:final members) ||
+      analyzer_ast.EnumDeclaration(:final members) ||
+      analyzer_ast.ExtensionDeclaration(:final members) ||
+      analyzer_ast.ExtensionTypeDeclaration(:final members) => members,
+      _ => const <analyzer_ast.ClassMember>[],
+    };
+    if (declaration is analyzer_ast.ExtensionTypeDeclaration) yield declaration.representation.fieldName;
+    for (final member in members) {
+      if (member is analyzer_ast.MethodDeclaration) yield member.name;
+      if (member is analyzer_ast.FieldDeclaration) {
+        for (final variable in member.fields.variables) {
+          yield variable.name;
+        }
+      }
+    }
+  }
+
+  /// Renames the private members declared under the same names by multiple merged libraries.
+  ///
+  /// Private members of different libraries are unrelated, but once the libraries are merged, they would
+  /// override or conflict with one another (e.g., `Child._init` would start overriding `Base._init`).
+  ///
+  void _resolvePrivateMemberClashes(List<_MergedSource> sources, Set<String> usedNames) {
+    final librariesByName = <String, Set<Uri>>{};
+    for (final source in sources) {
+      for (final declaration in source.result.unit.declarations) {
+        for (final name in _memberNames(declaration)) {
+          if (name.lexeme.startsWith('_')) {
+            librariesByName.putIfAbsent(name.lexeme, () => {}).add(source.result.libraryElement.uri);
+          }
+        }
+      }
+    }
+    final renames = <String, String>{};
+    for (final entry in librariesByName.entries) {
+      for (final library in entry.value.skip(1)) {
+        var index = 1;
+        var newName = '${entry.key}_$index';
+        while (usedNames.contains(newName)) {
+          newName = '${entry.key}_${++index}';
+        }
+        usedNames.add(newName);
+        renames['$library#${entry.key}'] = newName;
+        print('Renamed the private "${entry.key}" members of $library to "$newName" to avoid clashes between the merged libraries.');
+      }
+    }
+    if (renames.isEmpty) return;
+    for (final source in sources) {
+      source.result.unit.accept(_PrivateMemberVisitor(source: source, renames: renames));
+    }
+  }
+
   /// Renames the import prefixes shared by merged files for different libraries.
   ///
   /// A prefix may be shared by multiple files only if it refers to the same libraries in all of them.
@@ -774,13 +844,19 @@ class ProjectMerger {
     final references = _prepareSources(sources, imports);
     final usedNames = {..._collector.usedIdentifiers};
     _resolvePrefixClashes(imports, usedNames);
+    _resolvePrivateMemberClashes(sources, usedNames);
     final exportedNames = <String, analyzer_element.Element>{};
     final exports = _publicExports(sources, exportedNames);
     _resolveNameClashes(sources, references, imports, usedNames, exportedNames);
     await collection.dispose();
 
     final fileBuffer = StringBuffer();
-    final importTexts = <String>{for (final import in imports) '${import.text};'};
+    final importTexts = <String>{
+      // An explicit import of `dart:core` (e.g., `import 'dart:core' as $core;` in generated code)
+      // disables its implicit import, which the other merged libraries rely on.
+      if (imports.any((import) => import.libraryKey == 'dart:core')) "import 'dart:core';",
+      for (final import in imports) '${import.text};',
+    };
     for (final directive in [...importTexts, ...exports]) {
       fileBuffer.writeln(directive);
     }
@@ -933,5 +1009,76 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
     }
     _record(node.element, node.name, isPrefixed: isPrefixed);
     super.visitNamedType(node);
+  }
+}
+
+/// Renames the private class and extension members of the merged libraries, according to the [renames].
+///
+class _PrivateMemberVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
+  _PrivateMemberVisitor({
+    required this.source,
+    required this.renames,
+  });
+
+  final _MergedSource source;
+
+  /// New names, mapped by the private member keys.
+  ///
+  final Map<String, String> renames;
+
+  void _rename(analyzer_element.Element? element, analyzer_token.Token token) {
+    final newName = renames[ProjectMerger._privateMemberKey(element)];
+    if (newName != null && token.lexeme.startsWith('_')) source.addEdit(token.offset, token.end, newName);
+  }
+
+  @override
+  void visitImportDirective(analyzer_ast.ImportDirective node) {}
+
+  @override
+  void visitExportDirective(analyzer_ast.ExportDirective node) {}
+
+  @override
+  void visitMethodDeclaration(analyzer_ast.MethodDeclaration node) {
+    _rename(node.declaredFragment?.element, node.name);
+    super.visitMethodDeclaration(node);
+  }
+
+  @override
+  void visitVariableDeclaration(analyzer_ast.VariableDeclaration node) {
+    _rename(node.declaredFragment?.element, node.name);
+    super.visitVariableDeclaration(node);
+  }
+
+  @override
+  void visitRepresentationDeclaration(analyzer_ast.RepresentationDeclaration node) {
+    _rename(node.fieldFragment?.element, node.fieldName);
+    super.visitRepresentationDeclaration(node);
+  }
+
+  @override
+  void visitFieldFormalParameter(analyzer_ast.FieldFormalParameter node) {
+    _rename(node.declaredFragment?.element, node.name);
+    super.visitFieldFormalParameter(node);
+  }
+
+  @override
+  void visitSimpleIdentifier(analyzer_ast.SimpleIdentifier node) {
+    _rename(node.element ?? ObjectCollector.assignedElement(node), node.token);
+  }
+
+  @override
+  void visitPatternField(analyzer_ast.PatternField node) {
+    final name = node.name;
+    final newName = renames[ProjectMerger._privateMemberKey(node.element)];
+    if (name != null && newName != null) {
+      final nameToken = name.name;
+      if (nameToken != null) {
+        _rename(node.element, nameToken);
+      } else {
+        // Shorthand field (e.g., `Point(:var _x)`), the new name is inserted before the colon.
+        source.addEdit(name.colon.offset, name.colon.offset, newName);
+      }
+    }
+    super.visitPatternField(node);
   }
 }
