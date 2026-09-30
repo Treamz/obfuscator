@@ -649,10 +649,20 @@ class ProjectMerger {
       if (newName != null) reference.source.addEdit(reference.offset, reference.end, newName);
     }
 
-    // Third-party names resolving to different declarations are accessed with dedicated import prefixes.
+    // Third-party declarations provided under the [name] by the unprefixed imports of any of the merged files.
+    // Once merged, all of them are visible to all of the files, regardless of the combinators of other files.
+    Set<String> providers(String name) => {
+      for (final source in sources)
+        for (final import in source.result.libraryFragment.libraryImports)
+          if (import.prefix == null)
+            if (_topLevelElement(import.namespace.get2(name)) case final element?)
+              if (!_isMergedLibrary(element.library)) _topLevelKey(element),
+    };
+
+    // Third-party names which are ambiguous in the merged file are accessed with dedicated import prefixes.
     var prefixIndex = 0;
     for (final entry in externalReferencesByName.entries) {
-      if (entry.value.length < 2) continue;
+      if (entry.value.length < 2 && providers(entry.key).length < 2) continue;
       for (final elementReferences in entry.value.values) {
         final reference = elementReferences.first;
         final importUri = _findImportUri(reference.source, reference.element);
@@ -921,9 +931,17 @@ class ProjectMerger {
     final dependencyOverrides = mergeDependencies((pubspec) => pubspec.dependencyOverrides);
     final flutter = _mergeFlutterConfiguration();
 
+    // A single package keeps its name, so that references to its own assets (e.g., `package: 'name'`) remain valid.
+    final name = packages.length == 1 ? packages.single.name : 'merged_app';
+    if (packages.length > 1 && flutter != null) {
+      print(
+        'Warning: the assets of the merged packages are included with the "$name" package, '
+        'references to them with the original package names (e.g., `package: \'name\'`) must be updated.',
+      );
+    }
     final editor = yaml_edit.YamlEditor('');
     editor.update([], {
-      'name': 'merged_app',
+      'name': name,
       'description': 'A new merged application.',
       'version': '1.0.0+1',
       'publish_to': 'none',

@@ -204,6 +204,8 @@ void main() {
     test('generates a valid pubspec.yaml file', () {
       final pubspec = File(path.join(output, 'pubspec.yaml')).readAsStringSync();
       expect(pubspec, contains('sdk: ">=3.10.0 <4.0.0"'));
+      // A single merged package keeps its name, for the references to its own assets.
+      expect(pubspec, contains('name: merge_app'));
       expect(pubspec, isNot(contains('flutter:\n    sdk: flutter')));
       expect(pubspec, contains('dependency_overrides:'));
       expect(pubspec, contains(path.join(_temp.path, 'src', 'deps', 'localdep')));
@@ -232,10 +234,10 @@ void main() {
       expect(merged, contains('HashSet_1()'));
       final consumer = Directory(path.join(_temp.path, 'consumer', 'lib'))..createSync(recursive: true);
       File(path.join(consumer.parent.path, 'pubspec.yaml')).writeAsStringSync(
-        'name: consumer\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n  merged_app:\n    path: $output\n',
+        'name: consumer\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n  merge_app:\n    path: $output\n',
       );
       File(path.join(consumer.path, 'main.dart')).writeAsStringSync(
-        "import 'package:merged_app/merged.dart';\n\n"
+        "import 'package:merge_app/merged.dart';\n\n"
         "void main() => print('\${(HashSet<int>()..add(1)).length + Queue<int>().length} \${LinkedHashSet<int>().length} \${HashMap()}');\n",
       );
       final pubGet = await _run('dart', ['pub', 'get', '--offline'], workingDirectory: consumer.parent.path);

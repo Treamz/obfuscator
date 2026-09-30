@@ -198,7 +198,8 @@ https://github.com/ljmatan/obfuscator/tree/main/output
 
 - `<out>/copy/<name>/...` — obfuscated copy of each provided source project.
 - `<out>/lib/merged.dart` — single-file merge of the processed codebase.
-- `<out>/pubspec.yaml` — generated `pubspec.yaml`, merged from the source packages.
+- `<out>/pubspec.yaml` — generated `pubspec.yaml`, merged from the source packages. The merged package keeps
+  the name of the source package if a single one is provided, and is named `merged_app` otherwise.
 - `<out>/assets/...` — assets and fonts declared by the source packages.
 - `<out>/mappings.json` — JSON map of original → obfuscated symbol names.
 
