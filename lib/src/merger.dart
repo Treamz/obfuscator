@@ -264,34 +264,63 @@ class ProjectMerger {
     };
   }
 
+  /// Third-party libraries exported by the merged libraries, mapped by the exporting library URIs.
+  ///
+  final _externalExportsCache = <Uri, List<_Export>>{};
+
   /// Third-party libraries exported by the merged [library], directly or through other merged libraries.
   ///
-  /// Each export path is followed separately, so that the combinators of all of the paths are applied.
+  /// Each export path is followed, so that the combinators of all of the paths are applied.
   ///
-  List<_Export> _externalExports(
-    analyzer_element.LibraryElement library, [
-    Set<Uri> path = const {},
-  ]) {
-    final currentPath = {...path, library.uri};
-    final result = <_Export>[];
+  List<_Export> _externalExports(analyzer_element.LibraryElement library) => _collectExternalExports(library, {}).exports;
+
+  /// Collects the third-party exports of the [library], skipping the libraries [inProgress] (export cycles).
+  ///
+  /// The results are cached, unless an export cycle was skipped while collecting them.
+  ///
+  ({List<_Export> exports, bool isComplete}) _collectExternalExports(
+    analyzer_element.LibraryElement library,
+    Set<Uri> inProgress,
+  ) {
+    final cached = _externalExportsCache[library.uri];
+    if (cached != null) return (exports: cached, isComplete: true);
+    inProgress.add(library.uri);
+    var isComplete = true;
+    final exports = <String, _Export>{};
+    void add(_Export export) {
+      final key = [export.library.uri, for (final combinator in export.combinators) _combinatorSource(combinator)].join(' ');
+      exports.putIfAbsent(key, () => export);
+    }
+
     for (final fragment in library.fragments) {
       for (final export in fragment.libraryExports) {
         final exportedLibrary = export.exportedLibrary;
         if (exportedLibrary == null) continue;
         if (!_isMergedLibrary(exportedLibrary)) {
-          result.add((library: exportedLibrary, combinators: export.combinators));
-        } else if (!currentPath.contains(exportedLibrary.uri)) {
-          for (final nested in _externalExports(exportedLibrary, currentPath)) {
-            result.add((library: nested.library, combinators: [...nested.combinators, ...export.combinators]));
+          add((library: exportedLibrary, combinators: export.combinators));
+        } else if (inProgress.contains(exportedLibrary.uri)) {
+          isComplete = false;
+        } else {
+          final nested = _collectExternalExports(exportedLibrary, inProgress);
+          isComplete = isComplete && nested.isComplete;
+          for (final nestedExport in nested.exports) {
+            add((library: nestedExport.library, combinators: [...nestedExport.combinators, ...export.combinators]));
           }
         }
       }
     }
-    return result;
+    inProgress.remove(library.uri);
+    final result = exports.values.toList();
+    if (isComplete) _externalExportsCache[library.uri] = result;
+    return (exports: result, isComplete: isComplete);
   }
 
   /// Third-party libraries exported by the public (non-`src`) merged libraries, which remain exported
-  /// by the merged file. Names exported by multiple different declarations are hidden from the later exports.
+  /// by the merged file.
+  ///
+  /// Only the names which the public library actually exports from the third-party library are exported,
+  /// e.g., not the ones shadowed by its own declarations. Names exported from different declarations by
+  /// multiple libraries are exported only by the first one.
   ///
   List<String> _publicExports(List<_MergedSource> sources, Map<String, analyzer_element.Element> exportedNames) {
     final exports = <String>[];
@@ -302,13 +331,20 @@ class ProjectMerger {
       if (path.isWithin(path.join(libPath, 'src'), source.filePath) || !visitedLibraries.add(library.uri)) continue;
       for (final export in _externalExports(library)) {
         final hiddenNames = <String>[];
-        for (final entry in _exportedElements(export).entries) {
+        final exportedElements = _exportedElements(export);
+        for (final entry in exportedElements.entries) {
+          final exported = _topLevelElement(library.exportNamespace.get2(entry.key));
+          if (exported == null || _topLevelKey(exported) != _topLevelKey(entry.value)) {
+            hiddenNames.add(entry.key);
+            continue;
+          }
           final existing = exportedNames.putIfAbsent(entry.key, () => entry.value);
-          if (existing != entry.value) hiddenNames.add(entry.key);
+          if (_topLevelKey(existing) != _topLevelKey(entry.value)) {
+            print('Warning: "${entry.key}" is exported by multiple libraries, only the first one is exported.');
+            hiddenNames.add(entry.key);
+          }
         }
-        if (hiddenNames.isNotEmpty) {
-          print('Warning: names exported by multiple libraries are hidden from ${export.library.uri}: ${hiddenNames.join(', ')}.');
-        }
+        if (hiddenNames.length == exportedElements.length) continue;
         final text = [
           "export '${export.library.uri}'",
           for (final combinator in export.combinators) _combinatorSource(combinator),
@@ -485,14 +521,15 @@ class ProjectMerger {
     final libraryFragment = source.result.libraryElement.firstFragment;
     for (final import in libraryFragment.libraryImports) {
       if (import.prefix != null) continue;
-      final importedElement = import.namespace.get2(element.name!);
-      if (_topLevelElement(importedElement) != element.baseElement) continue;
+      final importedElement = _topLevelElement(import.namespace.get2(element.name!));
+      if (importedElement == null || _topLevelKey(importedElement) != _topLevelKey(element)) continue;
       final importedLibrary = import.importedLibrary;
       if (importedLibrary == null) continue;
       if (!_isMergedLibrary(importedLibrary)) return importedLibrary.uri.toString();
       // The element is re-exported by a merged library, it's imported from the exporting third-party library.
       for (final export in _externalExports(importedLibrary)) {
-        if (_exportedElements(export)[element.name] == element.baseElement) {
+        final exportedElement = _exportedElements(export)[element.name];
+        if (exportedElement != null && _topLevelKey(exportedElement) == _topLevelKey(element)) {
           return export.library.uri.toString();
         }
       }

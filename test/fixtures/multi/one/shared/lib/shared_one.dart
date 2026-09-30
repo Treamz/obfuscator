@@ -1,3 +1,5 @@
+export 'dart:collection' show Queue;
+
 class Entity {
   Entity(this.id);
 

@@ -1,5 +1,7 @@
 import 'package:shared_one/shared_one.dart';
 
+export 'dart:collection' show Queue;
+
 class User extends Entity {
   User(super.id, this.name);
 

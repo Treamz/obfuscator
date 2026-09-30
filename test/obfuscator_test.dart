@@ -235,12 +235,14 @@ void main() {
         'name: consumer\nenvironment:\n  sdk: ^3.10.0\ndependencies:\n  merged_app:\n    path: $output\n',
       );
       File(path.join(consumer.path, 'main.dart')).writeAsStringSync(
-        "import 'package:merged_app/merged.dart';\n\nvoid main() => print((HashSet<int>()..add(1)).length + Queue<int>().length);\n",
+        "import 'package:merged_app/merged.dart';\n\n"
+        "void main() => print('\${(HashSet<int>()..add(1)).length + Queue<int>().length} \${LinkedHashSet<int>().length} \${HashMap()}');\n",
       );
       final pubGet = await _run('dart', ['pub', 'get', '--offline'], workingDirectory: consumer.parent.path);
       expect(pubGet.exitCode, 0, reason: '${pubGet.stdout}${pubGet.stderr}');
       expect(await _errors(consumer.parent.path), isEmpty);
-      expect(await _runDart(consumer.parent.path, 'lib/main.dart'), '1\n');
+      // `HashMap` is the own declaration of a public library, which shadows the re-exported one.
+      expect(await _runDart(consumer.parent.path, 'lib/main.dart'), '1 0 own\n');
     });
 
     test('updates references of nested packages', () async {
@@ -267,6 +269,9 @@ void main() {
       expect(_sources(path.join(copyOne, 'lib')), isNot(_containsWord('id')));
       await _verifyOutput(source: two, copy: copyTwo, output: output);
       expect(File(path.join(output, 'pubspec.yaml')).readAsStringSync(), isNot(contains('shared_one')));
+      // Both packages export the same declarations, which isn't a conflict.
+      expect('${result.stdout}', isNot(contains('exported by multiple libraries')));
+      expect(File(path.join(output, 'lib', 'merged.dart')).readAsStringSync(), contains("export 'dart:collection' show Queue;"));
     });
   });
 
@@ -424,6 +429,18 @@ void main() {
       expect(File(path.join(copy, 'tools', 'c', 'pubspec.yaml')).readAsStringSync(), contains(path.join(copy, 'tools', 'b')));
       expect(await _errors(path.join(copy, 'tools', 'c')), isEmpty);
       expect(File(path.join(copy, 'tools', 'c', 'lib', 'c.dart')).readAsStringSync(), isNot(_containsWord('Root')));
+    });
+
+    test('skips nested packages with invalid pubspec files, such as templates', () async {
+      final package = await _prepareFixture('multi', name: 'templates');
+      final root = path.join(package, 'one', 'shared');
+      File(path.join(root, 'bricks', '__brick__', '{{name}}', 'pubspec.yaml'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync('name: {{name}}\n  invalid: [\n');
+      final output = path.join(_temp.path, 'out_templates');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect('${result.stdout}', contains('is not a valid pubspec.yaml file'));
     });
 
     test('reports conflicting dependency declarations', () async {

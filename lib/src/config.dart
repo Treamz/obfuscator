@@ -379,9 +379,12 @@ class Configuration {
     required bool keepWorkspaceResolution,
   }) {
     final pubspecFile = dart_io.File(path.join(copyDirectory, 'pubspec.yaml'));
-    final editor = yaml_edit.YamlEditor(pubspecFile.readAsStringSync());
-    final contents = editor.parseAt([]).value;
-    if (contents is! Map) return;
+    final editor = _parseYaml(pubspecFile);
+    final contents = editor?.parseAt([]).value;
+    if (editor == null || contents is! Map) {
+      print('Warning: ${pubspecFile.path} is not a valid pubspec.yaml file, it is copied without changes.');
+      return;
+    }
     if (contents['resolution'] == 'workspace' && !keepWorkspaceResolution) {
       editor.remove(['resolution']);
     }
@@ -511,10 +514,11 @@ class Configuration {
     }
     for (final package in packages) {
       for (final nestedDirectory in package.nestedPackageDirectories) {
+        final nestedPubspecFile = dart_io.File(path.join(nestedDirectory, 'pubspec.yaml'));
+        // Invalid pubspec files (e.g., templates) were already reported.
+        if (_parseYaml(nestedPubspecFile) == null) continue;
         try {
-          final nestedPubspec = pubspec_parse.Pubspec.parse(
-            dart_io.File(path.join(nestedDirectory, 'pubspec.yaml')).readAsStringSync(),
-          );
+          final nestedPubspec = pubspec_parse.Pubspec.parse(nestedPubspecFile.readAsStringSync());
           await runPubGet(
             directory: dart_io.Directory(nestedDirectory),
             flutter: SourcePackage.usesFlutterSdk(nestedPubspec),
@@ -525,6 +529,18 @@ class Configuration {
           );
         }
       }
+    }
+  }
+
+  /// Parses the YAML [file] for editing, or returns `null` if it isn't valid YAML (e.g., a template).
+  ///
+  static yaml_edit.YamlEditor? _parseYaml(dart_io.File file) {
+    try {
+      final editor = yaml_edit.YamlEditor(file.readAsStringSync());
+      editor.parseAt([]);
+      return editor;
+    } on FormatException {
+      return null;
     }
   }
 
@@ -539,7 +555,7 @@ class Configuration {
     ) {
       final pubspecFile = dart_io.File(path.join(directory, 'pubspec.yaml'));
       if (!pubspecFile.existsSync()) continue;
-      final contents = yaml_edit.YamlEditor(pubspecFile.readAsStringSync()).parseAt([]).value;
+      final contents = _parseYaml(pubspecFile)?.parseAt([]).value;
       if (contents is Map && contents.containsKey('workspace')) return true;
     }
     return false;
