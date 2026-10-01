@@ -12,7 +12,7 @@
 
 - Update README.md file.
 
-## Unreleased
+## 0.1.0
 
 - Validate all inputs before modifying the file system; never delete a non-empty output directory not created by the tool,
   and refuse output directories equal to, within, or containing a source directory.
