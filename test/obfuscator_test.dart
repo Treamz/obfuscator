@@ -811,7 +811,7 @@ void main() {
       expect(await _errors(keptOutput, 'lib/merged.dart'), isEmpty);
       expect(await _runDart(keptOutput, 'lib/merged.dart'), await _runDart(root, 'lib/main.dart'));
       expect(File(path.join(keptOutput, 'lib', 'merged.dart')).readAsStringSync(), contains('(value_1: 4,'));
-    });
+    }, skip: _sdkVersion < Version(3, 12, 0) ? 'Private named parameters require Dart 3.12' : false);
 
     test(
       'supports primary constructors',
