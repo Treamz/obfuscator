@@ -569,7 +569,9 @@ class Configuration {
       if (root == null || root.scheme != 'file') continue;
       final memberPubspec = dart_io.File(path.join(root.toFilePath(), 'pubspec.yaml'));
       if (!memberPubspec.existsSync()) continue;
-      if (_yamlValue(memberPubspec, 'resolution') == 'workspace') package.workspaceDependencies[entry.key] = path.normalize(root.toFilePath());
+      if (_yamlValue(memberPubspec, 'resolution') == 'workspace') {
+        package.workspaceDependencies[entry.key] = path.normalize(root.toFilePath());
+      }
     }
   }
 

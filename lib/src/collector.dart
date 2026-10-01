@@ -804,7 +804,8 @@ class _DynamicAccessVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
     final label = node.name.label;
     final element = label.element;
     if (node.parent is analyzer_ast.ArgumentList &&
-        (element == null || element is analyzer_element.FormalParameterElement && element.enclosingElement is! analyzer_element.ExecutableElement)) {
+        (element == null ||
+            element is analyzer_element.FormalParameterElement && element.enclosingElement is! analyzer_element.ExecutableElement)) {
       names.add(label.name);
     }
     super.visitNamedExpression(node);
