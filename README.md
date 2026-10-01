@@ -93,7 +93,7 @@ The project can also be ran using it's source code:
 Repo is fetched to the device using git.
 
 ```bash
-git clone https://github.com/ljmatan/obfuscator
+git clone https://github.com/Treamz/obfuscator
 ```
 
 2.2 Run the obfuscator:
@@ -168,9 +168,6 @@ Obfuscate a project while excluding declarations annotated with `NoObfuscation` 
 ```bash
 dart run bin/obfuscator.dart --src ./app --out ./out --pub NoObfuscation,Keep
 ```
-
-Example obfuscated code for various projects can be found in the `output` directory:
-https://github.com/ljmatan/obfuscator/tree/main/output
 
 ---
 
