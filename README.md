@@ -62,7 +62,7 @@ dependencies found in the sources.
 You can install the package from the command line:
 
 ```bash
-dart pub global activate obfuscator
+dart pub global activate dart_obfuscator
 ```
 
 1.2 Run the obfuscator:

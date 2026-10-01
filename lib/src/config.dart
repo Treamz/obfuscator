@@ -7,7 +7,7 @@ import 'package:args/args.dart' as args;
 import 'package:dart_style/dart_style.dart' as dart_style;
 import 'package:path/path.dart' as path;
 import 'package:pub_semver/pub_semver.dart' as pub_semver;
-import 'package:obfuscator/src/annotation.dart';
+import 'package:dart_obfuscator/src/annotation.dart';
 import 'package:pubspec_parse/pubspec_parse.dart' as pubspec_parse;
 import 'package:package_config/package_config.dart' as package_config;
 import 'package:yaml_edit/yaml_edit.dart' as yaml_edit;

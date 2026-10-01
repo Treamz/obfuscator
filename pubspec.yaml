@@ -1,4 +1,4 @@
-name: obfuscator
+name: dart_obfuscator
 description: Library used to obfuscate Dart and Flutter source code.
 version: 0.1.0
 repository: https://github.com/Treamz/obfuscator
