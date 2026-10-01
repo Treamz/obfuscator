@@ -562,14 +562,19 @@ class ProjectMerger {
   ///
   static Iterable<analyzer_token.Token> _memberNames(analyzer_ast.CompilationUnitMember declaration) sync* {
     final members = switch (declaration) {
-      analyzer_ast.ClassDeclaration(:final members) ||
-      analyzer_ast.MixinDeclaration(:final members) ||
-      analyzer_ast.EnumDeclaration(:final members) ||
-      analyzer_ast.ExtensionDeclaration(:final members) ||
-      analyzer_ast.ExtensionTypeDeclaration(:final members) => members,
+      analyzer_ast.ClassDeclaration(:final body) ||
+      analyzer_ast.MixinDeclaration(:final body) ||
+      analyzer_ast.ExtensionDeclaration(:final body) ||
+      analyzer_ast.ExtensionTypeDeclaration(:final body) => body.members,
+      analyzer_ast.EnumDeclaration(:final body) => body.members,
       _ => const <analyzer_ast.ClassMember>[],
     };
-    if (declaration is analyzer_ast.ExtensionTypeDeclaration) yield declaration.representation.fieldName;
+    // Declaring parameters of primary constructors (including the representations of extension types) declare fields.
+    for (final parameter in _primaryConstructorParameters(declaration)) {
+      final element = parameter.declaredFragment?.element;
+      final name = parameter.name;
+      if (element is analyzer_element.FieldFormalParameterElement && element.isDeclaring && name != null) yield name;
+    }
     for (final member in members) {
       if (member is analyzer_ast.MethodDeclaration) yield member.name;
       if (member is analyzer_ast.FieldDeclaration) {
@@ -578,6 +583,18 @@ class ProjectMerger {
         }
       }
     }
+  }
+
+  /// Formal parameters of the primary constructor of a class-like [declaration], if it has one.
+  ///
+  static List<analyzer_ast.FormalParameter> _primaryConstructorParameters(analyzer_ast.CompilationUnitMember declaration) {
+    final namePart = switch (declaration) {
+      analyzer_ast.ClassDeclaration(:final namePart) ||
+      analyzer_ast.EnumDeclaration(:final namePart) ||
+      analyzer_ast.ExtensionTypeDeclaration(:final namePart) => namePart,
+      _ => null,
+    };
+    return namePart is analyzer_ast.PrimaryConstructorDeclaration ? namePart.formalParameters.parameters : const [];
   }
 
   /// New names of the private members renamed to avoid clashes, mapped by their keys.
@@ -629,25 +646,25 @@ class ProjectMerger {
   /// only the concrete ones if [concrete].
   ///
   Iterable<String> _instanceMemberKeys(analyzer_element.InterfaceElement element, {required bool concrete}) sync* {
-    bool include(bool isStatic, bool isSynthetic, bool isAbstract) => !isStatic && !isSynthetic && !(concrete && isAbstract);
+    bool include(bool isStatic, bool isDeclared, bool isAbstract) => !isStatic && isDeclared && !(concrete && isAbstract);
     for (final field in element.fields) {
-      if (!include(field.isStatic, field.isSynthetic, field.isAbstract) || field.name == null) continue;
+      if (!include(field.isStatic, ObjectCollector.isDeclaredField(field), field.isAbstract) || field.name == null) continue;
       final name = _mergedMemberName(element, field.name!);
       yield 'get:$name';
       if (field.setter != null) yield 'set:$name';
     }
     for (final getter in element.getters) {
-      if (include(getter.isStatic, getter.isSynthetic, getter.isAbstract) && getter.name != null) {
+      if (include(getter.isStatic, getter.isOriginDeclaration, getter.isAbstract) && getter.name != null) {
         yield 'get:${_mergedMemberName(element, getter.name!)}';
       }
     }
     for (final setter in element.setters) {
-      if (include(setter.isStatic, setter.isSynthetic, setter.isAbstract) && setter.name != null) {
+      if (include(setter.isStatic, setter.isOriginDeclaration, setter.isAbstract) && setter.name != null) {
         yield 'set:${_mergedMemberName(element, setter.name!)}';
       }
     }
     for (final method in element.methods) {
-      if (include(method.isStatic, false, method.isAbstract) && method.name != null) {
+      if (include(method.isStatic, method.isOriginDeclaration, method.isAbstract) && method.name != null) {
         yield 'method:${_mergedMemberName(element, method.name!)}';
       }
     }
@@ -964,15 +981,18 @@ class ProjectMerger {
           stubs.write('\n  ${override}dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);\n');
         }
         switch (declaration) {
-          case analyzer_ast.ClassDeclaration(:final rightBracket):
+          case analyzer_ast.ClassDeclaration(body: analyzer_ast.BlockClassBody(:final rightBracket)):
             source.addEdit(rightBracket.offset, rightBracket.offset, stubs.toString());
+          case analyzer_ast.ClassDeclaration(body: analyzer_ast.EmptyClassBody(:final semicolon)):
+            // A class with an empty body (e.g., `class Point(final int x);`) gets a body with the stubs.
+            source.addEdit(semicolon.offset, semicolon.end, ' {$stubs}');
           case analyzer_ast.EnumDeclaration():
             _addEnumMembers(source, declaration, stubs.toString());
           case analyzer_ast.ClassTypeAlias(:final equals, :final semicolon, :final name) when isConvertedAlias:
             // `class A = S with M;` is declared as `class A extends S with M { ... }`, forwarding the superclass
             // constructors with super parameters.
             final mixinsHaveFields = element.mixins.any(
-              (mixin) => mixin.element.fields.any((field) => !field.isStatic && !field.isSynthetic),
+              (mixin) => mixin.element.fields.any((field) => !field.isStatic && ObjectCollector.isDeclaredField(field)),
             );
             final forwarders = StringBuffer();
             for (final constructor in superConstructors) {
@@ -1033,10 +1053,11 @@ class ProjectMerger {
       for (final library in entry.value.skip(1)) {
         var index = 1;
         var newName = '${entry.key}_$index';
-        while (usedNames.contains(newName)) {
+        // The public name of a private named parameter (e.g., `value_1` for `{this._value_1}`) must be unique as well.
+        while (usedNames.contains(newName) || usedNames.contains(newName.substring(1))) {
           newName = '${entry.key}_${++index}';
         }
-        usedNames.add(newName);
+        usedNames.addAll([newName, newName.substring(1)]);
         renames['$library#${entry.key}'] = newName;
         print('Renamed the private "${entry.key}" members of $library to "$newName" to avoid clashes between the merged libraries.');
       }
@@ -1298,10 +1319,13 @@ class ProjectMerger {
   /// Adds the [members] to an enum [declaration], separating them from the values if needed.
   ///
   void _addEnumMembers(_MergedSource source, analyzer_ast.EnumDeclaration declaration, String members) {
+    // Enums declare at least one value, so only augmentations have empty bodies.
+    final body = declaration.body;
+    if (body is! analyzer_ast.BlockEnumBody) return;
     // Enum members and `EnumName` require Dart 2.17.
     _requireLanguageVersion(pub_semver.Version(2, 17, 0));
-    final offset = declaration.rightBracket.offset;
-    if (declaration.semicolon == null) source.addEdit(offset, offset, ';', priority: 0);
+    final offset = body.rightBracket.offset;
+    if (body.semicolon == null) source.addEdit(offset, offset, ';', priority: 0);
     source.addEdit(offset, offset, members);
   }
 
@@ -1342,7 +1366,11 @@ class ProjectMerger {
     final element = _topLevelElement(declaration.declaredFragment?.element);
     if (element == null) return;
     final token = switch (declaration) {
-      analyzer_ast.NamedCompilationUnitMember(:final name) => name,
+      analyzer_ast.ClassDeclaration() ||
+      analyzer_ast.EnumDeclaration() ||
+      analyzer_ast.ExtensionTypeDeclaration() ||
+      analyzer_ast.MixinDeclaration() => ObjectCollector.declarationName(declaration),
+      analyzer_ast.FunctionDeclaration(:final name) || analyzer_ast.TypeAlias(:final name) => name,
       analyzer_ast.ExtensionDeclaration(:final name) => name,
       _ => null,
     };
@@ -1681,7 +1709,7 @@ class ProjectMerger {
     var success = true;
     var formattedCode = fileBuffer.toString();
     try {
-      formattedCode = _configuration.formatter.format(formattedCode);
+      formattedCode = Configuration.formatter(_mergedLanguageVersion(sources)).format(formattedCode);
     } catch (e) {
       success = false;
       print('Error: the merged code could not be formatted, as it is not valid Dart code:\n$e');
@@ -1816,20 +1844,21 @@ class _MergeReferenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> 
 
     for (analyzer_ast.AstNode? node = reference.parent; node != null; node = node.parent) {
       final isShadowing = switch (node) {
-        analyzer_ast.ClassDeclaration(:final typeParameters) ||
-        analyzer_ast.MixinDeclaration(:final typeParameters) ||
-        analyzer_ast.ExtensionDeclaration(:final typeParameters) => declares([
+        // The parameters of primary constructors are in the scope of their initializers and of the field initializers.
+        analyzer_ast.ClassDeclaration(:final namePart) || analyzer_ast.ExtensionTypeDeclaration(:final namePart) => declares([
+          ...typeParameterNames(namePart.typeParameters),
+          ...ProjectMerger._memberNames(node as analyzer_ast.CompilationUnitMember),
+          for (final parameter in ProjectMerger._primaryConstructorParameters(node)) parameter.name,
+        ]),
+        analyzer_ast.MixinDeclaration(:final typeParameters) || analyzer_ast.ExtensionDeclaration(:final typeParameters) => declares([
           ...typeParameterNames(typeParameters),
           ...ProjectMerger._memberNames(node as analyzer_ast.CompilationUnitMember),
         ]),
-        analyzer_ast.EnumDeclaration(:final typeParameters, :final constants) => declares([
-          ...typeParameterNames(typeParameters),
+        analyzer_ast.EnumDeclaration(:final namePart, :final body) => declares([
+          ...typeParameterNames(namePart.typeParameters),
           ...ProjectMerger._memberNames(node),
-          for (final constant in constants) constant.name,
-        ]),
-        analyzer_ast.ExtensionTypeDeclaration(:final typeParameters) => declares([
-          ...typeParameterNames(typeParameters),
-          ...ProjectMerger._memberNames(node),
+          for (final parameter in ProjectMerger._primaryConstructorParameters(node)) parameter.name,
+          for (final constant in body.constants) constant.name,
         ]),
         analyzer_ast.MethodDeclaration(:final parameters, :final typeParameters) => declares([
           ...parameterNames(parameters),
@@ -2016,16 +2045,55 @@ class _PrivateMemberVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
     super.visitVariableDeclaration(node);
   }
 
+  /// Renames the public name of a private named parameter (e.g., `value` for `{this._value}`),
+  /// along with the private name of the field it initializes.
+  ///
+  void _renamePublicName(analyzer_element.FormalParameterElement? parameter, analyzer_token.Token? token) {
+    if (token == null || token.lexeme.startsWith('_') || !ObjectCollector.isPrivateNamedParameter(parameter)) return;
+    final newName = renames[ProjectMerger._privateMemberKey(ObjectCollector.initializedField(parameter))];
+    if (newName != null) source.addEdit(token.offset, token.end, newName.substring(1));
+  }
+
+  /// Reports the declaration of a private named parameter whose public name is changed by the renaming of its field.
+  ///
+  void _warnPrivateNamedParameter(analyzer_element.FormalParameterElement? parameter, analyzer_token.Token? token) {
+    if (token == null || parameter is! analyzer_element.FieldFormalParameterElement || parameter.privateName == null) return;
+    final newName = renames[ProjectMerger._privateMemberKey(parameter)];
+    if (newName == null) return;
+    final location = source.result.lineInfo.getLocation(token.offset);
+    print(
+      'Warning: ${source.filePath}:${location.lineNumber}: the named parameter "${parameter.name}" is renamed to '
+      '"${newName.substring(1)}" along with its "${token.lexeme}" field, the invocations outside of the merged code must be updated.',
+    );
+  }
+
   @override
-  void visitRepresentationDeclaration(analyzer_ast.RepresentationDeclaration node) {
-    _rename(node.fieldFragment?.element, node.fieldName);
-    super.visitRepresentationDeclaration(node);
+  void visitRegularFormalParameter(analyzer_ast.RegularFormalParameter node) {
+    final element = node.declaredFragment?.element;
+    // Declaring parameters of primary constructors (including the representations of extension types) declare fields.
+    if (element is analyzer_element.FieldFormalParameterElement && node.name != null) _rename(element, node.name!);
+    _renamePublicName(element, node.name);
+    _warnPrivateNamedParameter(element, node.name);
+    super.visitRegularFormalParameter(node);
   }
 
   @override
   void visitFieldFormalParameter(analyzer_ast.FieldFormalParameter node) {
     _rename(node.declaredFragment?.element, node.name);
+    _warnPrivateNamedParameter(node.declaredFragment?.element, node.name);
     super.visitFieldFormalParameter(node);
+  }
+
+  @override
+  void visitSuperFormalParameter(analyzer_ast.SuperFormalParameter node) {
+    _renamePublicName(node.declaredFragment?.element, node.name);
+    super.visitSuperFormalParameter(node);
+  }
+
+  @override
+  void visitNamedArgument(analyzer_ast.NamedArgument node) {
+    _renamePublicName(node.correspondingParameter, node.name);
+    super.visitNamedArgument(node);
   }
 
   @override
@@ -2250,8 +2318,7 @@ class _ExtensionOverrideVisitor extends analyzer_visitor.RecursiveAstVisitor<voi
     // Getters and setters invoked on the implicit `this`, the other forms are handled by their parents.
     if (parent is analyzer_ast.PrefixedIdentifier && parent.identifier == node ||
         parent is analyzer_ast.PropertyAccess && parent.propertyName == node ||
-        parent is analyzer_ast.MethodInvocation && parent.methodName == node ||
-        parent is analyzer_ast.Label) {
+        parent is analyzer_ast.MethodInvocation && parent.methodName == node) {
       return;
     }
     if (parent is analyzer_ast.ForEachPartsWithIdentifier) {
@@ -2413,7 +2480,6 @@ class _ImplicitThisVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
     if (parent is analyzer_ast.PrefixedIdentifier && parent.identifier == node ||
         parent is analyzer_ast.PropertyAccess && parent.propertyName == node ||
         parent is analyzer_ast.MethodInvocation && parent.methodName == node && (parent.target != null || parent.isCascaded) ||
-        parent is analyzer_ast.Label ||
         parent is analyzer_ast.ConstructorName ||
         parent is analyzer_ast.Combinator) {
       return;
@@ -2499,18 +2565,12 @@ class _WildcardVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
   }
 
   @override
-  void visitSimpleFormalParameter(analyzer_ast.SimpleFormalParameter node) {
+  void visitRegularFormalParameter(analyzer_ast.RegularFormalParameter node) {
     // Parameters of function types don't declare variables.
     if (node.thisOrAncestorOfType<analyzer_ast.GenericFunctionType>() == null) {
       _declare(node.declaredFragment?.element, node.name);
     }
-    super.visitSimpleFormalParameter(node);
-  }
-
-  @override
-  void visitFunctionTypedFormalParameter(analyzer_ast.FunctionTypedFormalParameter node) {
-    _declare(node.declaredFragment?.element, node.name);
-    super.visitFunctionTypedFormalParameter(node);
+    super.visitRegularFormalParameter(node);
   }
 
   @override

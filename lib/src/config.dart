@@ -6,6 +6,7 @@ import 'package:analyzer/dart/ast/ast.dart' as analyzer_ast;
 import 'package:args/args.dart' as args;
 import 'package:dart_style/dart_style.dart' as dart_style;
 import 'package:path/path.dart' as path;
+import 'package:pub_semver/pub_semver.dart' as pub_semver;
 import 'package:obfuscator/src/annotation.dart';
 import 'package:pubspec_parse/pubspec_parse.dart' as pubspec_parse;
 import 'package:package_config/package_config.dart' as package_config;
@@ -787,13 +788,19 @@ class Configuration {
     );
   }
 
-  /// Dart code formatter.
+  /// Dart code formatter, parsing the code with the [languageVersion] (or the latest one, if unknown).
   ///
-  final formatter = dart_style.DartFormatter(
-    lineEnding: '\n',
-    trailingCommas: dart_style.TrailingCommas.preserve,
-    languageVersion: dart_style.DartFormatter.latestLanguageVersion,
-  );
+  /// The language version determines the valid syntax (e.g., `final` parameters of methods are invalid since Dart 3.13),
+  /// and the formatting style (the "tall" style since Dart 3.7).
+  ///
+  static dart_style.DartFormatter formatter(pub_semver.Version? languageVersion) {
+    final latest = dart_style.DartFormatter.latestLanguageVersion;
+    return dart_style.DartFormatter(
+      lineEnding: '\n',
+      trailingCommas: dart_style.TrailingCommas.preserve,
+      languageVersion: languageVersion == null || languageVersion > latest ? latest : languageVersion,
+    );
+  }
 
   /// Instantiate required class resources.
   ///
