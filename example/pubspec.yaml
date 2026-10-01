@@ -1,4 +1,4 @@
-name: obfuscator_example
+name: dart_obfuscator_example
 description: Example project used to showcase the obfuscation service.
 version: 1.0.0
 

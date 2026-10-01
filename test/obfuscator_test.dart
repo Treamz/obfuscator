@@ -3,7 +3,7 @@ library;
 
 import 'dart:io';
 
-import 'package:obfuscator/src/config.dart';
+import 'package:dart_obfuscator/src/config.dart';
 import 'package:path/path.dart' as path;
 import 'package:pub_semver/pub_semver.dart';
 import 'package:test/test.dart';
