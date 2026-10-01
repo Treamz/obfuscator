@@ -1709,7 +1709,7 @@ class ProjectMerger {
     var success = true;
     var formattedCode = fileBuffer.toString();
     try {
-      formattedCode = _configuration.formatter.format(formattedCode);
+      formattedCode = Configuration.formatter(_mergedLanguageVersion(sources)).format(formattedCode);
     } catch (e) {
       success = false;
       print('Error: the merged code could not be formatted, as it is not valid Dart code:\n$e');

@@ -727,6 +727,24 @@ String describeLegacy() {
       expect(await _runDart(path.join(output, 'copy', 'app'), 'test/app_test.dart'), 'ann\n');
     });
 
+    test('formats the merged code with its language version', () async {
+      // `final` parameters of methods are only invalid since Dart 3.13, along with primary constructors.
+      final root = path.join(_temp.path, 'final_parameters');
+      await _writePackages(
+        root,
+        {
+          'pubspec.yaml': 'name: final_parameters\nenvironment:\n  sdk: ^3.10.0\n',
+          'lib/main.dart':
+              'class Reader {\n  num read(final String input) => num.parse(input) * 2;\n}\n\nvoid main() => print(Reader().read(\'21\'));\n',
+        },
+        ['.'],
+      );
+      final output = path.join(_temp.path, 'out_final_parameters');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      expect(await _runDart(output, 'lib/merged.dart'), '42\n');
+    });
+
     test('keeps private named parameters valid', () async {
       final root = path.join(_temp.path, 'private_named');
       await _writePackages(
@@ -896,7 +914,7 @@ void main() {
         final copy = path.join(output, 'copy', 'primary');
         await _verifyOutput(source: root, copy: copy, output: output);
         final copied = _sources(path.join(copy, 'lib'));
-        for (final name in ['Point', 'x', 'width', 'height', 'Labeled', 'text', 'hex', 'Legacy', 'amount', 'factor', 'doubled']) {
+        for (final name in ['Point', 'y', 'width', 'height', 'Labeled', 'text', 'hex', 'Legacy', 'amount', 'factor', 'doubled']) {
           expect(copied, isNot(_containsWord(name)), reason: name);
         }
         // The merger renames the clashing classes and private fields declared by primary constructors.
