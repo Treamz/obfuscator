@@ -30,3 +30,23 @@ jobs:
 
       - name: Run tests
         run: dart test
+
+  # The minimum SDK supported by the package (`environment: sdk` in `pubspec.yaml`).
+  # Formatting is only checked with the stable SDK, as the formatter output may differ between versions.
+  min-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: 3.11.0
+
+      - name: Install dependencies
+        run: dart pub get
+
+      - name: Analyze
+        run: dart analyze --fatal-infos lib bin test
+
+      - name: Run tests
+        run: dart test
