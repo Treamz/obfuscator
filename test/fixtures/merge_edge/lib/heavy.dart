@@ -1,0 +1,1 @@
+int heavyCompute() => 42;

@@ -1,0 +1,13 @@
+name: merge_edge
+description: Fixture covering merging edge cases.
+publish_to: none
+environment:
+  sdk: ^3.10.0
+dependencies:
+  localdep:
+    path: ../deps/localdep
+  otherdep:
+    path: ../deps/otherdep
+dev_dependencies:
+  devdep:
+    path: ../deps/devdep

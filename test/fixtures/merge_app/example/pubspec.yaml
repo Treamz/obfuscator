@@ -1,0 +1,7 @@
+name: merge_app_example
+publish_to: none
+environment:
+  sdk: ^3.10.0
+dependencies:
+  merge_app:
+    path: ..

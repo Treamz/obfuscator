@@ -1,0 +1,5 @@
+name: core
+description: Fixture covering field and class renaming. Named "core" on purpose, see the review.
+publish_to: none
+environment:
+  sdk: ^3.10.0
