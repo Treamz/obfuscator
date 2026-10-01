@@ -5,12 +5,16 @@ import 'dart:io';
 
 import 'package:obfuscator/src/config.dart';
 import 'package:path/path.dart' as path;
+import 'package:pub_semver/pub_semver.dart';
 import 'package:test/test.dart';
 
 /// Location of the fixture packages.
 final _fixtures = path.absolute('test', 'fixtures');
 
 late Directory _temp;
+
+/// Version of the Dart SDK running the tests.
+final _sdkVersion = Version.parse(Platform.version.split(' ').first);
 
 late String _cli;
 
@@ -722,6 +726,190 @@ String describeLegacy() {
       expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
       expect(await _runDart(path.join(output, 'copy', 'app'), 'test/app_test.dart'), 'ann\n');
     });
+
+    test('keeps private named parameters valid', () async {
+      final root = path.join(_temp.path, 'private_named');
+      await _writePackages(
+        root,
+        {
+          'pubspec.yaml': 'name: private_named\nenvironment:\n  sdk: ^3.12.0\n',
+          'lib/a.dart': 'class Other {\n  Other(this._value);\n\n  final int _value;\n\n  int get value => _value + 100;\n}\n',
+          'lib/b.dart': r'''
+class Box {
+  Box({required this._value, this.label = 'box'});
+
+  final int _value;
+  final String label;
+
+  int get doubled => _value * 2;
+}
+
+class Crate extends Box {
+  Crate({required super.value}) : super(label: 'crate');
+}
+
+abstract class Wrapper {
+  factory Wrapper({required int value}) = _Wrapped;
+
+  int get unwrapped;
+}
+
+class _Wrapped implements Wrapper {
+  _Wrapped({required this._value});
+
+  final int _value;
+
+  @override
+  int get unwrapped => _value;
+}
+
+String describe() => '${Box(value: 2).doubled} ${Crate(value: 3).doubled}';
+''',
+          'lib/main.dart': r'''
+import 'a.dart';
+import 'b.dart';
+
+void main() {
+  final box = Box(value: 4, label: 'large');
+  print('${Other(1).value} ${box.label} ${box.doubled} ${Crate(value: 5).label} ${Wrapper(value: 6).unwrapped} ${describe()}');
+}
+''',
+        },
+        ['.'],
+      );
+      // The fields initialized by private named parameters keep their names, which determine the parameter names.
+      final output = path.join(_temp.path, 'out_private_named');
+      final result = await _obfuscate(['--src=$root', '--out=$output']);
+      expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+      final copy = path.join(output, 'copy', 'private_named');
+      await _verifyOutput(source: root, copy: copy, output: output);
+      expect(File(path.join(copy, 'lib', 'b.dart')).readAsStringSync(), _containsWord('_value'));
+      expect(File(path.join(copy, 'lib', 'b.dart')).readAsStringSync(), isNot(_containsWord('label')));
+      // Once merged, the clashing private fields are renamed along with the public names of the parameters.
+      final keptOutput = path.join(_temp.path, 'out_private_named_kept');
+      final keptResult = await _obfuscate(['--src=$root', '--out=$keptOutput', '--pub=_value']);
+      expect(keptResult.exitCode, 0, reason: '${keptResult.stdout}${keptResult.stderr}');
+      expect(keptResult.stdout, contains('the named parameter "value" is renamed to "value_1"'));
+      expect(await _errors(keptOutput, 'lib/merged.dart'), isEmpty);
+      expect(await _runDart(keptOutput, 'lib/merged.dart'), await _runDart(root, 'lib/main.dart'));
+      expect(File(path.join(keptOutput, 'lib', 'merged.dart')).readAsStringSync(), contains('(value_1: 4,'));
+    });
+
+    test(
+      'supports primary constructors',
+      () async {
+        final root = path.join(_temp.path, 'primary');
+        await _writePackages(
+          root,
+          {
+            'pubspec.yaml': 'name: primary\nenvironment:\n  sdk: ^3.13.0\n',
+            'lib/shapes.dart': r'''
+class Point(final int x, final int y) {
+  this : assert(x >= 0);
+
+  int get sum => x + y;
+}
+
+class Size({required final int width, final int height = 1});
+
+class Labeled.named(final String text) {
+  String shout() => text.toUpperCase();
+}
+
+extension type Meters(int value) {
+  Meters twice() => Meters(value * 2);
+}
+
+enum Tone(final String hex) {
+  red('#f00'),
+  blue('#00f');
+
+  String get code => hex;
+}
+
+class Legacy {
+  new create(this.amount);
+
+  factory build() => Legacy.create(7);
+
+  final int amount;
+}
+
+abstract class Base {
+  int get _secret;
+
+  int reveal() => 1;
+}
+
+class Counter(final int _count) {
+  int get count => _count;
+}
+
+class Item(final String name);
+
+class Scaled(final int factor) {
+  final int doubled = factor * 2;
+}
+
+int Function() peekSecret(Base base) => () => base._secret;
+''',
+            'lib/impl.dart': r'''
+import 'shapes.dart';
+
+class Impl(final int value) extends Base;
+
+class Tally(final int _count) {
+  int get count => _count + 1000;
+}
+
+class Item(final int id);
+
+String describeImpl() => '${Impl(3).value} ${Impl(4).reveal()} ${Tally(2).count} ${Item(9).id}';
+''',
+            'lib/main.dart': r'''
+import 'impl.dart' hide Item;
+import 'shapes.dart';
+
+void main() {
+  final size = Size(width: 3);
+  print([
+    Point(1, 2).sum,
+    '${size.width}x${size.height}',
+    Size(width: 4, height: 5).height,
+    Labeled.named('hey').shout(),
+    Meters(21).twice().value,
+    Tone.blue.code,
+    Legacy.build().amount,
+    Counter(5).count,
+    Item('item').name,
+    Scaled(4).doubled,
+    describeImpl(),
+  ].join(' '));
+}
+''',
+          },
+          ['.'],
+        );
+        final output = path.join(_temp.path, 'out_primary');
+        final result = await _obfuscate(['--src=$root', '--out=$output']);
+        expect(result.exitCode, 0, reason: '${result.stdout}${result.stderr}');
+        final copy = path.join(output, 'copy', 'primary');
+        await _verifyOutput(source: root, copy: copy, output: output);
+        final copied = _sources(path.join(copy, 'lib'));
+        for (final name in ['Point', 'x', 'width', 'height', 'Labeled', 'text', 'hex', 'Legacy', 'amount', 'factor', 'doubled']) {
+          expect(copied, isNot(_containsWord(name)), reason: name);
+        }
+        // The merger renames the clashing classes and private fields declared by primary constructors.
+        final keptOutput = path.join(_temp.path, 'out_primary_kept');
+        final keptResult = await _obfuscate(['--src=$root', '--out=$keptOutput', '--pub=Item,_count,Base']);
+        expect(keptResult.exitCode, 0, reason: '${keptResult.stdout}${keptResult.stderr}');
+        expect(await _errors(keptOutput, 'lib/merged.dart'), isEmpty);
+        expect(await _runDart(keptOutput, 'lib/merged.dart'), await _runDart(root, 'lib/main.dart'));
+        final merged = File(path.join(keptOutput, 'lib', 'merged.dart')).readAsStringSync();
+        expect(merged, allOf(contains('class Item_1(final String name);'), contains('_count_1')));
+      },
+      skip: _sdkVersion < Version(3, 13, 0) ? 'Primary constructors require Dart 3.13' : false,
+    );
 
     test('reports conflicting dependency declarations', () async {
       final root = Directory(path.join(_temp.path, 'conflict'));

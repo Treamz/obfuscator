@@ -200,44 +200,70 @@ class ObjectCollector {
   /// Parameters initialising fields (directly or through super parameters or redirecting factories)
   /// share the identifier of the field, as their names must match.
   ///
-  static String? keyFor(analyzer_element.Element? element, [int depth = 0]) {
-    if (element == null || depth > 32) return null;
-    final base = element.baseElement;
+  static String? keyFor(analyzer_element.Element? element) {
+    final base = element?.baseElement;
     if (base is analyzer_element.ClassElement) return classKey(base);
     if (base is analyzer_element.FieldElement) return _fieldKey(base);
     if (base is analyzer_element.PropertyAccessorElement) {
       final variable = base.variable;
       return variable is analyzer_element.FieldElement ? _fieldKey(variable) : null;
     }
-    if (base is analyzer_element.FieldFormalParameterElement) return _fieldKey(base.field);
+    if (base is analyzer_element.FormalParameterElement) return _fieldKey(initializedField(base));
+    return null;
+  }
+
+  /// The field initialized by a [parameter], directly (including the declaring parameters of primary constructors),
+  /// or through super parameters, redirecting factories or the constructors of mixin applications.
+  ///
+  static analyzer_element.FieldElement? initializedField(analyzer_element.FormalParameterElement? parameter, [int depth = 0]) {
+    final base = parameter?.baseElement;
+    if (base == null || depth > 32) return null;
+    if (base is analyzer_element.FieldFormalParameterElement) return base.field;
     if (base is analyzer_element.SuperFormalParameterElement) {
-      return keyFor(base.superConstructorParameter, depth + 1);
+      return initializedField(base.superConstructorParameter, depth + 1);
     }
-    if (base is analyzer_element.FormalParameterElement && base.isNamed) {
-      final constructor = base.enclosingElement;
-      // Constructors of mixin applications (e.g., `class A = B with M;`) forward to the superclass constructors.
-      final enclosingClass = constructor?.enclosingElement;
-      if (constructor is analyzer_element.ConstructorElement &&
-          constructor.isSynthetic &&
-          enclosingClass is analyzer_element.ClassElement &&
-          enclosingClass.isMixinApplication) {
-        final superConstructor = constructor.superConstructor;
-        if (superConstructor != null) {
-          for (final parameter in superConstructor.formalParameters) {
-            if (parameter.isNamed && parameter.name == base.name) return keyFor(parameter, depth + 1);
-          }
-        }
-      }
-      if (constructor is analyzer_element.ConstructorElement && constructor.isFactory) {
-        final redirectedConstructor = constructor.redirectedConstructor;
-        if (redirectedConstructor != null) {
-          for (final parameter in redirectedConstructor.formalParameters) {
-            if (parameter.isNamed && parameter.name == base.name) return keyFor(parameter, depth + 1);
-          }
-        }
-      }
+    if (!base.isNamed) return null;
+    final constructor = base.enclosingElement;
+    if (constructor is! analyzer_element.ConstructorElement) return null;
+    // Constructors of mixin applications (e.g., `class A = B with M;`) forward to the superclass constructors.
+    final enclosingClass = constructor.enclosingElement;
+    final forwardedConstructor = constructor.isOriginMixinApplication && enclosingClass is analyzer_element.ClassElement
+        ? constructor.superConstructor
+        : constructor.isFactory
+        ? constructor.redirectedConstructor
+        : null;
+    for (final forwarded in forwardedConstructor?.formalParameters ?? const <analyzer_element.FormalParameterElement>[]) {
+      if (forwarded.isNamed && forwarded.name == base.name) return initializedField(forwarded, depth + 1);
     }
     return null;
+  }
+
+  /// Whether a named [parameter] initializes a private field, and is passed under the corresponding public name
+  /// (e.g., `value: 1` for `{this._value}`).
+  ///
+  static bool isPrivateNamedParameter(analyzer_element.FormalParameterElement? parameter) {
+    final name = parameter?.name;
+    final fieldName = initializedField(parameter)?.name;
+    return parameter != null && parameter.isNamed && name != null && fieldName != null && fieldName != name;
+  }
+
+  /// Whether a [field] is declared explicitly, by a field declaration or a declaring parameter of a primary constructor,
+  /// rather than induced by a getter or setter.
+  ///
+  static bool isDeclaredField(analyzer_element.FieldElement field) {
+    return field.isOriginDeclaration || field.isOriginDeclaringFormalParameter;
+  }
+
+  /// Name token of a class-like [declaration], or `null` for the other declarations.
+  ///
+  static analyzer_token.Token? declarationName(analyzer_ast.CompilationUnitMember? declaration) {
+    return switch (declaration) {
+      analyzer_ast.ClassDeclaration(:final namePart) ||
+      analyzer_ast.EnumDeclaration(:final namePart) ||
+      analyzer_ast.ExtensionTypeDeclaration(:final namePart) => namePart.typeName,
+      analyzer_ast.MixinDeclaration(:final name) => name,
+      _ => null,
+    };
   }
 
   /// Returns the symbol selected for obfuscation which the [element] reference resolves to.
@@ -421,13 +447,13 @@ class ObjectCollector {
   ///
   static Iterable<({String name, bool isStatic})> _declaredMembers(analyzer_element.InterfaceElement element) sync* {
     for (final field in element.fields) {
-      if (!field.isSynthetic && field.name != null) yield (name: field.name!, isStatic: field.isStatic);
+      if (isDeclaredField(field) && field.name != null) yield (name: field.name!, isStatic: field.isStatic);
     }
     for (final accessor in [...element.getters, ...element.setters]) {
-      if (!accessor.isSynthetic && accessor.name != null) yield (name: accessor.name!, isStatic: accessor.isStatic);
+      if (accessor.isOriginDeclaration && accessor.name != null) yield (name: accessor.name!, isStatic: accessor.isStatic);
     }
     for (final method in element.methods) {
-      if (method.name != null) yield (name: method.name!, isStatic: method.isStatic);
+      if (method.isOriginDeclaration && method.name != null) yield (name: method.name!, isStatic: method.isStatic);
     }
   }
 
@@ -508,6 +534,8 @@ class ObjectCollector {
     for (final entry in declarations.fields.entries) {
       if (declarations.dynamicMemberNames.contains(entry.value.name)) nonRenamableMembers.add(entry.key);
     }
+    // Fields initialized by private named parameters keep their names, which determine the public parameter names.
+    nonRenamableMembers.addAll(declarations.privateNamedParameterFields);
     for (final element in declarations.interfaces) {
       for (final member in _declaredMembers(element)) {
         addMember(element, member.name);
@@ -650,6 +678,10 @@ class _Declarations {
   /// Names of the members accessed dynamically (e.g., on a `dynamic` receiver), which can't be resolved.
   ///
   final dynamicMemberNames = <String>{};
+
+  /// Keys of the fields initialized by private named parameters (e.g., `{this._value}`).
+  ///
+  final privateNamedParameterFields = <String>{};
 }
 
 /// Disjoint-set structure used for grouping overriding members.
@@ -712,7 +744,7 @@ class _DeclarationVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
 
   @override
   void visitClassDeclaration(analyzer_ast.ClassDeclaration node) {
-    _addClass(node, node.declaredFragment?.element, node.name.lexeme);
+    _addClass(node, node.declaredFragment?.element, node.namePart.typeName.lexeme);
     super.visitClassDeclaration(node);
   }
 
@@ -740,27 +772,69 @@ class _DeclarationVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
     super.visitExtensionTypeDeclaration(node);
   }
 
-  @override
-  void visitFieldDeclaration(analyzer_ast.FieldDeclaration node) {
-    super.visitFieldDeclaration(node);
-    if (!source.isDeclarable || node.externalKeyword != null || collector._isExcluded(node)) return;
+  /// Name of the class, mixin or enum declaring the fields of the [node], if they can be obfuscated.
+  ///
+  String? _fieldParentName(analyzer_ast.AstNode node) {
     final parentDeclaration = node.thisOrAncestorOfType<analyzer_ast.CompilationUnitMember>();
     if (parentDeclaration is! analyzer_ast.ClassDeclaration &&
         parentDeclaration is! analyzer_ast.MixinDeclaration &&
         parentDeclaration is! analyzer_ast.EnumDeclaration) {
-      return;
+      return null;
     }
-    if (collector._isExcluded(parentDeclaration!)) return;
-    final parentName = (parentDeclaration as analyzer_ast.NamedCompilationUnitMember).name.lexeme;
-    if (collector._configuration.publicApiIdentifiers.contains(parentName)) return;
+    if (collector._isExcluded(parentDeclaration!)) return null;
+    final parentName = ObjectCollector.declarationName(parentDeclaration)!.lexeme;
+    return collector._configuration.publicApiIdentifiers.contains(parentName) ? null : parentName;
+  }
+
+  void _addField(analyzer_element.FieldElement? element, String name, String parentName) {
+    final enclosingElement = element?.enclosingElement;
+    if (enclosingElement is! analyzer_element.InterfaceElement) return;
+    declarations.fields[ObjectCollector.memberKey(enclosingElement, name)] = (name: name, parentName: parentName);
+  }
+
+  @override
+  void visitFieldDeclaration(analyzer_ast.FieldDeclaration node) {
+    super.visitFieldDeclaration(node);
+    if (!source.isDeclarable || node.externalKeyword != null || collector._isExcluded(node)) return;
+    final parentName = _fieldParentName(node);
+    if (parentName == null) return;
     for (final variable in node.fields.variables) {
       final element = variable.declaredFragment?.element;
       final name = variable.name.lexeme;
       if (element is! analyzer_element.FieldElement || collector._isExcluded(variable, name: name)) continue;
-      final enclosingElement = element.enclosingElement;
-      if (enclosingElement is! analyzer_element.InterfaceElement) continue;
-      declarations.fields[ObjectCollector.memberKey(enclosingElement, name)] = (name: name, parentName: parentName);
+      _addField(element, name, parentName);
     }
+  }
+
+  @override
+  void visitRegularFormalParameter(analyzer_ast.RegularFormalParameter node) {
+    super.visitRegularFormalParameter(node);
+    final element = node.declaredFragment?.element;
+    final name = node.name?.lexeme;
+    _recordPrivateNamedParameter(element);
+    // Declaring parameters of primary constructors (e.g., `class Point(final int x)`) declare fields.
+    if (element is! analyzer_element.FieldFormalParameterElement || !element.isDeclaring || name == null) return;
+    if (!source.isDeclarable || collector._isExcluded(node, name: name)) return;
+    final parentName = _fieldParentName(node);
+    if (parentName != null) _addField(element.field, name, parentName);
+  }
+
+  @override
+  void visitFieldFormalParameter(analyzer_ast.FieldFormalParameter node) {
+    super.visitFieldFormalParameter(node);
+    _recordPrivateNamedParameter(node.declaredFragment?.element);
+  }
+
+  @override
+  void visitSuperFormalParameter(analyzer_ast.SuperFormalParameter node) {
+    super.visitSuperFormalParameter(node);
+    _recordPrivateNamedParameter(node.declaredFragment?.element);
+  }
+
+  void _recordPrivateNamedParameter(analyzer_element.FormalParameterElement? element) {
+    if (!ObjectCollector.isPrivateNamedParameter(element)) return;
+    final key = ObjectCollector.keyFor(element);
+    if (key != null) declarations.privateNamedParameterFields.add(key);
   }
 }
 
@@ -797,18 +871,15 @@ class _DynamicAccessVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
   }
 
   @override
-  void visitNamedExpression(analyzer_ast.NamedExpression node) {
+  void visitNamedArgument(analyzer_ast.NamedArgument node) {
     // A named argument of a dynamic invocation (e.g., of a `Function` value), or of a function type, can't be
     // matched to the parameter of the invoked function, which may be an initializing formal of a field
     // (e.g., `builders['user']!(id: 7)` or `(switch (x) { _ => User.new })(id: 7)` for `User.new`).
-    final label = node.name.label;
-    final element = label.element;
-    if (node.parent is analyzer_ast.ArgumentList &&
-        (element == null ||
-            element is analyzer_element.FormalParameterElement && element.enclosingElement is! analyzer_element.ExecutableElement)) {
-      names.add(label.name);
+    final element = node.correspondingParameter;
+    if (element == null || element.enclosingElement is! analyzer_element.ExecutableElement) {
+      names.add(node.name.lexeme);
     }
-    super.visitNamedExpression(node);
+    super.visitNamedArgument(node);
   }
 
   @override
@@ -822,12 +893,12 @@ class _DynamicAccessVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
   }
 
   @override
-  void visitFunctionTypedFormalParameter(analyzer_ast.FunctionTypedFormalParameter node) {
-    for (final parameter in node.parameters.parameters) {
+  void visitFunctionTypedFormalParameterSuffix(analyzer_ast.FunctionTypedFormalParameterSuffix node) {
+    for (final parameter in node.formalParameters.parameters) {
       final name = parameter.name;
       if (parameter.isNamed && name != null) names.add(name.lexeme);
     }
-    super.visitFunctionTypedFormalParameter(node);
+    super.visitFunctionTypedFormalParameterSuffix(node);
   }
 }
 
@@ -863,7 +934,7 @@ class _OccurrenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
 
   @override
   void visitClassDeclaration(analyzer_ast.ClassDeclaration node) {
-    _record(node.declaredFragment?.element, node.name, isDeclaration: true);
+    _record(node.declaredFragment?.element, node.namePart.typeName, isDeclaration: true);
     super.visitClassDeclaration(node);
   }
 
@@ -896,9 +967,17 @@ class _OccurrenceVisitor extends analyzer_visitor.RecursiveAstVisitor<void> {
   }
 
   @override
-  void visitSimpleFormalParameter(analyzer_ast.SimpleFormalParameter node) {
-    _record(node.declaredFragment?.element, node.name);
-    super.visitSimpleFormalParameter(node);
+  void visitRegularFormalParameter(analyzer_ast.RegularFormalParameter node) {
+    final element = node.declaredFragment?.element;
+    // Declaring parameters of primary constructors are the declarations of their fields.
+    _record(element, node.name, isDeclaration: element is analyzer_element.FieldFormalParameterElement && element.isDeclaring);
+    super.visitRegularFormalParameter(node);
+  }
+
+  @override
+  void visitNamedArgument(analyzer_ast.NamedArgument node) {
+    _record(node.correspondingParameter, node.name);
+    super.visitNamedArgument(node);
   }
 
   @override

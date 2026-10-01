@@ -25,3 +25,5 @@
 - Rewrite the merger using the analyzer: remove directives, first-party import prefixes and name clashes,
   and merge SDK constraints, dependency overrides, hosted URLs, path dependencies and Flutter assets.
 - Add the `--seed` argument for deterministic output, and report errors without stack traces.
+- Migrate to the analyzer 14 package (requires Dart 3.11), supporting primary constructors and private named
+  parameters.

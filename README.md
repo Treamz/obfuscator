@@ -251,8 +251,9 @@ https://github.com/ljmatan/obfuscator/tree/main/output
   Fields accessed on `dynamic` receivers, and fields named like the named parameters of function types (e.g., for
   constructor tear-offs) keep their original names, but `Symbol` literals and `runtimeType.toString()` comparisons
   (class names are obfuscated) are not handled.
-- **Language versions**: the tool is built on the analyzer 8 package, which doesn't support the syntax introduced by
-  Dart 3.12 and newer (e.g., private named parameters).
+- **Language versions**: the tool is built on the analyzer 14 package and requires Dart 3.11 or newer. It supports
+  the syntax up to Dart 3.13, including primary constructors and private named parameters. Fields initialized by
+  private named parameters (e.g., `{this._value}`) keep their names, as they determine the public parameter names.
 - **Merged output**: the merged file is a single library. Clashing top-level names, private members and import
   prefixes are renamed, and extension member invocations which could resolve differently are made explicit.
   Library-level annotations, conditional imports of first-party libraries, and extension operators, cascaded
