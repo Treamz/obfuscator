@@ -1,9 +1,9 @@
 import 'dart:io' as dart_io;
 
-import 'package:obfuscator/src/collector.dart';
-import 'package:obfuscator/src/config.dart';
-import 'package:obfuscator/src/generator.dart';
-import 'package:obfuscator/src/merger.dart';
+import 'package:dart_obfuscator/src/collector.dart';
+import 'package:dart_obfuscator/src/config.dart';
+import 'package:dart_obfuscator/src/generator.dart';
+import 'package:dart_obfuscator/src/merger.dart';
 
 void main(
   List<String> arguments,

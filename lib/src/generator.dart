@@ -2,9 +2,9 @@ import 'dart:convert' as dart_convert;
 import 'dart:io' as dart_io;
 import 'dart:math' as dart_math;
 
-import 'package:obfuscator/src/collector.dart';
-import 'package:obfuscator/src/config.dart';
-import 'package:obfuscator/src/mappings.dart';
+import 'package:dart_obfuscator/src/collector.dart';
+import 'package:dart_obfuscator/src/config.dart';
+import 'package:dart_obfuscator/src/mappings.dart';
 
 /// Object utilised for generating resources required for obfuscation operations.
 ///

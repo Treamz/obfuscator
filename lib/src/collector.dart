@@ -11,7 +11,7 @@ import 'package:analyzer/dart/element/element.dart' as analyzer_element;
 import 'package:analyzer/dart/element/type.dart' as analyzer_type;
 import 'package:analyzer/diagnostic/diagnostic.dart' as analyzer_diagnostic;
 import 'package:analyzer/error/error.dart' as analyzer_error;
-import 'package:obfuscator/src/config.dart';
+import 'package:dart_obfuscator/src/config.dart';
 import 'package:path/path.dart' as path;
 
 /// Dart source code file reference.

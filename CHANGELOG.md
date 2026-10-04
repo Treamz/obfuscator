@@ -12,8 +12,10 @@
 
 - Update README.md file.
 
-## Unreleased
+## 0.1.0
 
+- Rename the package to `dart_obfuscator`, as the `obfuscator` name is taken on pub.dev. The `obfuscator` command
+  name is kept.
 - Validate all inputs before modifying the file system; never delete a non-empty output directory not created by the tool,
   and refuse output directories equal to, within, or containing a source directory.
 - Match declarations and references through the resolved element model, fixing references to shadowed names,
